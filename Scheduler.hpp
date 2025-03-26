@@ -51,6 +51,8 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t now);
     void TaskComplete(Time_t now, TaskId_t task_id);
+    void MonitorSLA0Tasks(Time_t now);
+    void OptimizeForSLA0Tasks();
     
 private:
     // Thresholds for underload/overload detection
