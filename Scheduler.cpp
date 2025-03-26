@@ -17,44 +17,116 @@ static Scheduler scheduler;
 void Scheduler::Init() {
     migratingVMs.clear();
     unsigned totalMachines = Machine_GetTotal();
+    
+    // Track machines by CPU type and GPU capability
     std::map<CPUType_t, std::vector<MachineId_t>> machinesByCPU;
+    std::map<CPUType_t, std::vector<MachineId_t>> gpuMachinesByCPU;
+    
+    // First, categorize all machines
     for (unsigned i = 0; i < totalMachines; i++) {
         MachineId_t machineId = MachineId_t(i);
         machines.push_back(machineId);
+        
         MachineInfo_t info = Machine_GetInfo(machineId);
         CPUType_t cpuType = info.cpu;
-        machinesByCPU[cpuType].push_back(machineId);
+        
+        // Categorize by CPU type and GPU capability
+        if (info.gpus) {
+            gpuMachinesByCPU[cpuType].push_back(machineId);
+        } else {
+            machinesByCPU[cpuType].push_back(machineId);
+        }
     }
     
-    // Create more VMs initially to handle the workload better
+    // Create VMs for each CPU type and GPU capability
     for (const auto &pair : machinesByCPU) {
         CPUType_t cpuType = pair.first;
         const std::vector<MachineId_t> &machinesWithCPU = pair.second;
+        
         if (machinesWithCPU.empty()) continue;
         
-        // Create more VMs initially - up to 8 per CPU type
-        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 8u);
+        // Create VMs for this CPU type - at least 2 per CPU type
+        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 4u);
+        
         for (unsigned i = 0; i < numVMsToCreate; i++) {
             VMId_t vm = VM_Create(LINUX, cpuType);
             vms.push_back(vm);
+            
             MachineId_t machine = machinesWithCPU[i % machinesWithCPU.size()];
             VM_Attach(vm, machine);
+            
             activeMachines.insert(machine);
             machineUtilization[machine] = 0.0;
         }
     }
     
+    // Create VMs for GPU-enabled machines
+    for (const auto &pair : gpuMachinesByCPU) {
+        CPUType_t cpuType = pair.first;
+        const std::vector<MachineId_t> &gpuMachines = pair.second;
+        
+        if (gpuMachines.empty()) continue;
+        
+        // Create VMs for GPU-enabled machines - at least 2 per CPU type
+        unsigned numVMsToCreate = std::min(static_cast<unsigned>(gpuMachines.size()), 4u);
+        
+        for (unsigned i = 0; i < numVMsToCreate; i++) {
+            VMId_t vm = VM_Create(LINUX, cpuType);
+            vms.push_back(vm);
+            
+            MachineId_t machine = gpuMachines[i % gpuMachines.size()];
+            VM_Attach(vm, machine);
+            
+            activeMachines.insert(machine);
+            machineUtilization[machine] = 0.0;
+        }
+    }
+    
+    // Create AIX VMs for POWER CPUs if available
+    for (unsigned i = 0; i < totalMachines; i++) {
+        MachineId_t machineId = MachineId_t(i);
+        MachineInfo_t info = Machine_GetInfo(machineId);
+        
+        if (info.cpu == POWER && activeMachines.find(machineId) == activeMachines.end()) {
+            VMId_t vm = VM_Create(AIX, POWER);
+            vms.push_back(vm);
+            VM_Attach(vm, machineId);
+            
+            activeMachines.insert(machineId);
+            machineUtilization[machineId] = 0.0;
+            break; // Just create one AIX VM
+        }
+    }
+    
     // Power down unused machines to save energy
     for (MachineId_t machine : machines) {
-        if (activeMachines.find(machine) == activeMachines.end()) Machine_SetState(machine, S5);
+        if (activeMachines.find(machine) == activeMachines.end()) {
+            Machine_SetState(machine, S5);
+        }
     }
 }
 
 bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
-    if (IsVMMigrating(vm)) return false;
+    // First check if VM is migrating
+    if (IsVMMigrating(vm)) {
+        return false;
+    }
+    
     try {
+        // Get VM info and validate
         VMInfo_t info = VM_GetInfo(vm);
-        if (info.machine_id == MachineId_t(-1)) return false;
+        
+        // Check if VM is attached to a machine
+        if (info.machine_id == MachineId_t(-1)) {
+            return false;
+        }
+        
+        // Check if the machine is active
+        if (activeMachines.find(info.machine_id) == activeMachines.end()) {
+            return false;
+        }
+        
+        // Check if task exists in this VM
         bool taskFound = false;
         for (TaskId_t t : info.active_tasks) {
             if (t == task) {
@@ -62,29 +134,36 @@ bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
                 break;
             }
         }
-        if (!taskFound) return false;
+        
+        if (!taskFound) {
+            return false;
+        }
+        
+        // Double-check VM state before removing task
         if (!IsVMMigrating(vm)) {
             VM_RemoveTask(vm, task);
             return true;
         }
+        
         return false;
     } 
     catch (...) {
-        SimOutput("SafeRemoveTask CAUGHT",4);
         return false;
     }
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
+    // Get task requirements
     CPUType_t required_cpu = RequiredCPUType(task_id);
     VMType_t required_vm = RequiredVMType(task_id);
     SLAType_t sla_type = RequiredSLA(task_id);
+    bool gpu_required = IsTaskGPUCapable(task_id);
     
-    // Prioritize SLA0 and SLA1 tasks with HIGH_PRIORITY
+    // Assign priority based on SLA
     Priority_t priority;
     switch (sla_type) {
     case SLA0:
-        priority = HIGH_PRIORITY;
+        priority = MID_PRIORITY;
         break;
     case SLA1:
         priority = MID_PRIORITY;
@@ -98,49 +177,71 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         break;
     }
     
-    // Find the best VM for this task
+    // Find a suitable VM
     VMId_t target_vm = VMId_t(-1);
     unsigned lowest_task_count = UINT_MAX;
     
-    // For SLA0 and SLA1, find VM with fewest tasks
+    // For high-priority tasks, find VM with fewest tasks
     if (sla_type == SLA0 || sla_type == SLA1) {
         for (VMId_t vm : vms) {
             if (IsVMMigrating(vm)) continue;
             
             try {
                 VMInfo_t info = VM_GetInfo(vm);
-                if (info.cpu == required_cpu) {
-                    // Prefer empty VMs for high-priority tasks
-                    if (info.active_tasks.empty()) {
-                        target_vm = vm;
-                        break;
-                    }
-                    else if (info.active_tasks.size() < lowest_task_count) {
-                        lowest_task_count = info.active_tasks.size();
-                        target_vm = vm;
+                
+                // Check if VM is attached to a machine
+                if (info.machine_id == MachineId_t(-1)) continue;
+                
+                // Check if machine is active
+                if (activeMachines.find(info.machine_id) == activeMachines.end()) continue;
+                
+                // Check CPU type and VM type
+                if (info.cpu == required_cpu && info.vm_type == required_vm) {
+                    // Check GPU requirement
+                    MachineInfo_t machineInfo = Machine_GetInfo(info.machine_id);
+                    if ((gpu_required && machineInfo.gpus) || !gpu_required) {
+                        // Prefer empty VMs for high-priority tasks
+                        if (info.active_tasks.empty()) {
+                            target_vm = vm;
+                            break;
+                        }
+                        else if (info.active_tasks.size() < lowest_task_count) {
+                            lowest_task_count = info.active_tasks.size();
+                            target_vm = vm;
+                        }
                     }
                 }
             } catch (...) {
-                SimOutput("NewTask 1 CAUGHT",4);
                 continue;
             }
         }
     } 
-    // For other SLA types, find any suitable VM
+    // For other tasks, find any suitable VM
     else {
         for (VMId_t vm : vms) {
             if (IsVMMigrating(vm)) continue;
             
             try {
                 VMInfo_t info = VM_GetInfo(vm);
-                if (info.cpu == required_cpu) {
-                    if (info.active_tasks.size() < lowest_task_count) {
-                        lowest_task_count = info.active_tasks.size();
-                        target_vm = vm;
+                
+                // Check if VM is attached to a machine
+                if (info.machine_id == MachineId_t(-1)) continue;
+                
+                // Check if machine is active
+                if (activeMachines.find(info.machine_id) == activeMachines.end()) continue;
+                
+                // Check CPU type and VM type
+                if (info.cpu == required_cpu && info.vm_type == required_vm) {
+                    // Check GPU requirement
+                    MachineInfo_t machineInfo = Machine_GetInfo(info.machine_id);
+                    if ((gpu_required && machineInfo.gpus) || !gpu_required) {
+                        if (info.active_tasks.size() < lowest_task_count) {
+                            lowest_task_count = info.active_tasks.size();
+                            target_vm = vm;
+                        }
                     }
                 }
             } catch (...) {
-                SimOutput("NewTask 2 CAUGHT",4);
                 continue;
             }
         }
@@ -148,26 +249,20 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     
     // If no suitable VM found, create a new one
     if (target_vm == VMId_t(-1)) {
+        // Find a suitable machine
         MachineId_t target_machine = MachineId_t(-1);
         
-        // First check active machines with the required CPU
+        // First check active machines
         for (MachineId_t machine : activeMachines) {
             try {
                 MachineInfo_t info = Machine_GetInfo(machine);
-                if (info.cpu == required_cpu) {
-                    // For SLA0/SLA1, prefer machines with fewer tasks
-                    if (sla_type == SLA0 || sla_type == SLA1) {
-                        if (info.active_tasks < 2) {
-                            target_machine = machine;
-                            break;
-                        }
-                    } else {
-                        target_machine = machine;
-                        break;
-                    }
+                
+                // Check CPU type and GPU requirement
+                if (info.cpu == required_cpu && ((gpu_required && info.gpus) || !gpu_required)) {
+                    target_machine = machine;
+                    break;
                 }
             } catch (...) {
-                SimOutput("NewTask 3 CAUGHT",4);
                 continue;
             }
         }
@@ -179,7 +274,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 
                 try {
                     MachineInfo_t info = Machine_GetInfo(machine);
-                    if (info.cpu == required_cpu) {
+                    
+                    // Check CPU type and GPU requirement
+                    if (info.cpu == required_cpu && ((gpu_required && info.gpus) || !gpu_required)) {
                         Machine_SetState(machine, S0);
                         activeMachines.insert(machine);
                         machineUtilization[machine] = 0.0;
@@ -187,7 +284,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                         break;
                     }
                 } catch (...) {
-                    SimOutput("NewTask 4 CAUGHT",4);
                     continue;
                 }
             }
@@ -200,7 +296,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 VM_Attach(target_vm, target_machine);
                 vms.push_back(target_vm);
                 
-                // For SLA0/SLA1, set cores to maximum performance immediately
+                // For high-priority tasks, set machine to maximum performance
                 if (sla_type == SLA0 || sla_type == SLA1) {
                     MachineInfo_t machineInfo = Machine_GetInfo(target_machine);
                     for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
@@ -208,22 +304,29 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     }
                 }
             } catch (...) {
-                SimOutput("NewTask 5 CAUGHT",4);
+                // VM creation failed
             }
         }
     }
     
     // Assign task to VM
     if (target_vm != VMId_t(-1)) {
+        // Double-check VM state before adding task
         if (IsVMMigrating(target_vm)) return;
         
         try {
             VMInfo_t info = VM_GetInfo(target_vm);
+            
+            // Check if VM is attached to a machine
             if (info.machine_id == MachineId_t(-1)) return;
             
+            // Check if machine is active
+            if (activeMachines.find(info.machine_id) == activeMachines.end()) return;
+            
+            // Add task to VM
             VM_AddTask(target_vm, task_id, priority);
             
-            // For SLA0/SLA1, ensure the machine is at maximum performance
+            // For high-priority tasks, ensure machine is at maximum performance
             if (sla_type == SLA0 || sla_type == SLA1) {
                 MachineId_t machine = info.machine_id;
                 MachineInfo_t machineInfo = Machine_GetInfo(machine);
@@ -232,7 +335,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 }
             }
         } catch (...) {
-            SimOutput("NewTask 6 CAUGHT",4);
+            // Task assignment failed
         }
     }
 }
@@ -248,7 +351,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
             }
             machineUtilization[machine] = utilization;
         } catch (...) {
-            SimOutput("Periodic 1 CAUGHT",4);
             continue;
         }
     }
@@ -258,7 +360,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
         try {
             MachineInfo_t info = Machine_GetInfo(machine);
             
-            // Check for SLA0/SLA1 tasks on this machine
+            // Check for high-priority tasks on this machine
             bool hasHighPriorityTasks = false;
             
             for (VMId_t vm : vms) {
@@ -278,7 +380,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     
                     if (hasHighPriorityTasks) break;
                 } catch (...) {
-                    SimOutput("Periodic 2 CAUGHT",4);
                     continue;
                 }
             }
@@ -310,7 +411,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 }
             }
         } catch (...) {
-            SimOutput("Periodic 3 CAUGHT",4);
             continue;
         }
     }
@@ -325,7 +425,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     underutilizedMachines.push_back(machine);
                 }
             } catch (...) {
-                SimOutput("Periodic 4 CAUGHT",4);
                 continue;
             }
         }
@@ -356,7 +455,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                         
                         if (hasHighPriorityTasks) break;
                     } catch (...) {
-                        SimOutput("Periodic 5 CAUGHT",4);
                         continue;
                     }
                 }
@@ -389,7 +487,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                 break;
                             }
                         } catch (...) {
-                            SimOutput("Periodic 6 CAUGHT",4);
                             continue;
                         }
                     }
@@ -399,6 +496,16 @@ void Scheduler::PeriodicCheck(Time_t now) {
                         try {
                             VMInfo_t vmInfo = VM_GetInfo(vmToMigrate);
                             CPUType_t vmCpuType = vmInfo.cpu;
+                            VMType_t vmType = vmInfo.vm_type;
+                            bool needsGPU = false;
+                            
+                            // Check if any tasks in this VM need GPU
+                            for (TaskId_t task : vmInfo.active_tasks) {
+                                if (IsTaskGPUCapable(task)) {
+                                    needsGPU = true;
+                                    break;
+                                }
+                            }
                             
                             // Find a suitable target machine
                             MachineId_t targetMachine = MachineId_t(-1);
@@ -409,7 +516,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                 
                                 try {
                                     MachineInfo_t machineInfo = Machine_GetInfo(machine);
+                                    
+                                    // Check CPU type and GPU requirement
                                     if (machineInfo.cpu == vmCpuType && 
+                                        ((needsGPU && machineInfo.gpus) || !needsGPU) &&
                                         machineUtilization[machine] > bestUtilization && 
                                         machineUtilization[machine] < OVERLOAD_THRESHOLD) {
                                         
@@ -417,7 +527,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                         bestUtilization = machineUtilization[machine];
                                     }
                                 } catch (...) {
-                                    SimOutput("Periodic 7 CAUGHT",4);
                                     continue;
                                 }
                             }
@@ -428,13 +537,13 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                 VM_Migrate(vmToMigrate, targetMachine);
                             }
                         } catch (...) {
-                            SimOutput("Periodic 8 CAUGHT",4);
+                            // Migration failed, reset state
                             MarkVMAsReady(vmToMigrate);
                         }
                     }
                 }
             } catch (...) {
-                SimOutput("Periodic 9 CAUGHT",4);
+                // Error accessing source machine
             }
         }
     }
@@ -451,7 +560,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             }
             machineUtilization[machine] = utilization;
         } catch (...) {
-            SimOutput("Task Complete 1 CAUGHT",4);
             continue;
         }
     }
@@ -459,14 +567,18 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 void Scheduler::Shutdown(Time_t time) {
     for(auto & vm: vms) {
-        VM_Shutdown(vm);
+        try {
+            VM_Shutdown(vm);
+        } catch (...) {
+            // Ignore shutdown errors
+        }
     }
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    MarkVMAsReady(vm_id);
+    // This method is called by MigrationDone
 }
 
 void InitScheduler() {
@@ -501,7 +613,6 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                     vmTaskCount[vm] = vmInfo.active_tasks.size();
                 }
             } catch (...) {
-                SimOutput("MemoryWarning 1 CAUGHT",4);
                 continue;
             }
         }
@@ -522,14 +633,20 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
             try {
                 VMInfo_t vmInfo = VM_GetInfo(largestVM);
                 CPUType_t vmCpuType = vmInfo.cpu;
+                VMType_t vmType = vmInfo.vm_type;
                 
                 // Check for high-priority tasks
                 bool hasHighPriorityTasks = false;
+                bool needsGPU = false;
+                
                 for (TaskId_t task : vmInfo.active_tasks) {
                     SLAType_t slaType = RequiredSLA(task);
                     if (slaType == SLA0 || slaType == SLA1) {
                         hasHighPriorityTasks = true;
-                        break;
+                    }
+                    
+                    if (IsTaskGPUCapable(task)) {
+                        needsGPU = true;
                     }
                 }
                 
@@ -539,24 +656,26 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 for (MachineId_t machine : scheduler.GetMachines()) {
                     if (machine == machine_id) continue;
                     if (!scheduler.IsMachineActive(machine)) continue;
-                    MachineInfo_t info = Machine_GetInfo(machine);
-                    if (info.s_state != S0) continue;
+                    
                     try {
                         MachineInfo_t info = Machine_GetInfo(machine);
-                        if (info.cpu != vmCpuType) continue;
                         
-                        // For VMs with high-priority tasks, prefer machines with no tasks
-                        if (hasHighPriorityTasks) {
-                            if (info.active_tasks == 0) {
+                        // Check CPU type, VM type, and GPU requirement
+                        if (info.cpu == vmCpuType && 
+                            ((needsGPU && info.gpus) || !needsGPU)) {
+                            
+                            // For VMs with high-priority tasks, prefer machines with no tasks
+                            if (hasHighPriorityTasks) {
+                                if (info.active_tasks == 0) {
+                                    targetMachine = machine;
+                                    break;
+                                }
+                            } else if (info.active_tasks < 2) {
                                 targetMachine = machine;
                                 break;
                             }
-                        } else if (info.active_tasks < 2) {
-                            targetMachine = machine;
-                            break;
                         }
                     } catch (...) {
-                        SimOutput("MemoryWarning 2 CAUGHT",4);
                         continue;
                     }
                 }
@@ -565,18 +684,20 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 if (targetMachine == MachineId_t(-1)) {
                     for (MachineId_t machine : scheduler.GetMachines()) {
                         if (scheduler.IsMachineActive(machine)) continue;
-                        MachineInfo_t info = Machine_GetInfo(machine);
-                        if (info.s_state != S0) continue;
+                        
                         try {
                             MachineInfo_t info = Machine_GetInfo(machine);
-                            if (info.cpu != vmCpuType) continue;
                             
-                            Machine_SetState(machine, S0);
-                            scheduler.ActivateMachine(machine);
-                            targetMachine = machine;
-                            break;
+                            // Check CPU type and GPU requirement
+                            if (info.cpu == vmCpuType && 
+                                ((needsGPU && info.gpus) || !needsGPU)) {
+                                
+                                Machine_SetState(machine, S0);
+                                scheduler.ActivateMachine(machine);
+                                targetMachine = machine;
+                                break;
+                            }
                         } catch (...) {
-                            SimOutput("MemoryWarning 3 CAUGHT",4);
                             continue;
                         }
                     }
@@ -586,24 +707,9 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 if (targetMachine != MachineId_t(-1)) {
                     scheduler.MarkVMAsMigrating(largestVM);
                     VM_Migrate(largestVM, targetMachine);
-                } else {
-                    // If migration not possible, power on another machine as a last resort
-                    for (MachineId_t machine : scheduler.GetMachines()) {
-                        if (scheduler.IsMachineActive(machine)) continue;
-                        MachineInfo_t info = Machine_GetInfo(machine);
-                        if (info.s_state != S0) continue;
-                        try {
-                            Machine_SetState(machine, S0);
-                            scheduler.ActivateMachine(machine);
-                            break;
-                        } catch (...) {
-                            SimOutput("MemoryWarning 4 CAUGHT",4);
-                            continue;
-                        }
-                    }
                 }
             } catch (...) {
-                SimOutput("MemoryWarning 5 CAUGHT",4);
+                // Error during migration
                 scheduler.MarkVMAsReady(largestVM);
             }
         }
@@ -613,17 +719,20 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
             Machine_SetCorePerformance(machine_id, i, P0);
         }
     } catch (...) {
-        SimOutput("MemoryWarning 6 CAUGHT",4);
+        // Error accessing machine info
     }
 }
 
-void SchedulerCheck(Time_t time) {
-    scheduler.PeriodicCheck(time);
+void MigrationDone(Time_t time, VMId_t vm_id) {
+    scheduler.MarkVMAsReady(vm_id);
+    scheduler.MigrationComplete(time, vm_id);
 }
 
-void MigrationDone(Time_t time, VMId_t vm_id) {
-    SimOutput("Migration done for vm " + vm_id,4);
-    scheduler.MigrationComplete(time, vm_id);
+void SchedulerCheck(Time_t time) {
+    static unsigned checkCount = 0;
+    checkCount++;
+    
+    scheduler.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
@@ -662,19 +771,25 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
                         break;
                     }
                 } catch (...) {
-                    SimOutput("StateChangeComplete 1 CAUGHT",4);
                     continue;
                 }
             }
             
-            // Create a VM if needed
+            // Create a VM if needed - match the VM type to the CPU type
             if (!hasVM) {
                 try {
-                    VMId_t newVM = VM_Create(LINUX, machineInfo.cpu);
+                    VMType_t vmType = LINUX; // Default
+                    
+                    // Use AIX for POWER CPUs
+                    if (machineInfo.cpu == POWER) {
+                        vmType = AIX;
+                    }
+                    
+                    VMId_t newVM = VM_Create(vmType, machineInfo.cpu);
                     VM_Attach(newVM, machine_id);
                     scheduler.AddVM(newVM);
                 } catch (...) {
-                    SimOutput("StateChangeComplete 2 CAUGHT",4);
+                    // VM creation failed
                 }
             }
         }
@@ -682,11 +797,8 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             scheduler.DeactivateMachine(machine_id);
         }
     } catch (...) {
-        SimOutput("StateChangeComplete 3 CAUGHT",4);
+        // Error accessing machine info
     }
-    
-    // Run periodic check to update system state
-    scheduler.PeriodicCheck(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
@@ -701,7 +813,13 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
         
         try {
             VMInfo_t vmInfo = VM_GetInfo(vm);
+            
+            // Check if VM is attached to a machine
             if (vmInfo.machine_id == MachineId_t(-1)) continue;
+            
+            // Check if machine is active
+            if (!scheduler.IsMachineActive(vmInfo.machine_id)) continue;
+            
             for (TaskId_t task : vmInfo.active_tasks) {
                 if (task == task_id) {
                     taskVM = vm;
@@ -712,7 +830,6 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
             
             if (taskVM != VMId_t(-1)) break;
         } catch (...) {
-            SimOutput("SLAWarning 1 CAUGHT",4);
             continue;
         }
     }
@@ -731,40 +848,24 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                     Machine_SetCorePerformance(taskMachine, i, P0);
                 }
                 
+                // Only attempt to move tasks if VM is not migrating
                 if (!scheduler.IsVMMigrating(taskVM)) {
-
                     // Move other tasks away from this VM if possible
-
                     VMInfo_t vmInfo = VM_GetInfo(taskVM);
-
                     
-
                     std::vector<TaskId_t> tasksToMove;
-
                     for (TaskId_t otherTask : vmInfo.active_tasks) {
-
                         if (otherTask == task_id) continue;
-
                         
-
                         SLAType_t otherSlaType = RequiredSLA(otherTask);
-
                         if (otherSlaType != SLA0 && otherSlaType != SLA1) {
-
                             tasksToMove.push_back(otherTask);
-
                         }
-
                     }
-
                     
-
                     // Process one task at a time
-
                     if (!tasksToMove.empty()) {
-
                         TaskId_t otherTask = tasksToMove[0];
-
                         
                         // Find another VM for this lower-priority task
                         VMId_t targetVM = VMId_t(-1);
@@ -774,33 +875,47 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                             
                             try {
                                 VMInfo_t otherVMInfo = VM_GetInfo(vm);
+                                
+                                // Check if VM is attached to a machine
                                 if (otherVMInfo.machine_id == MachineId_t(-1)) continue;
-                                if (otherVMInfo.cpu == vmInfo.cpu && otherVMInfo.active_tasks.size() < 3) {
-                                    targetVM = vm;
-                                    break;
+                                
+                                // Check if machine is active
+                                if (!scheduler.IsMachineActive(otherVMInfo.machine_id)) continue;
+                                
+                                // Check CPU and VM type compatibility
+                                if (otherVMInfo.cpu == vmInfo.cpu && 
+                                    otherVMInfo.vm_type == vmInfo.vm_type && 
+                                    otherVMInfo.active_tasks.size() < 3) {
+                                    
+                                    // Check GPU requirement if needed
+                                    bool needsGPU = IsTaskGPUCapable(otherTask);
+                                    MachineInfo_t otherMachineInfo = Machine_GetInfo(otherVMInfo.machine_id);
+                                    
+                                    if ((needsGPU && otherMachineInfo.gpus) || !needsGPU) {
+                                        targetVM = vm;
+                                        break;
+                                    }
                                 }
                             } catch (...) {
-                                SimOutput("SLAWarning 2 CAUGHT",4);
                                 continue;
                             }
                         }
                         
                         // Move the task if a suitable VM was found
                         if (targetVM != VMId_t(-1)) {
+                            // Use SafeRemoveTask to ensure all safety checks
                             if (scheduler.SafeRemoveTask(taskVM, otherTask)) {
                                 try {
-
                                     VM_AddTask(targetVM, otherTask, MID_PRIORITY);
-
                                 } catch (...) {
-                                    SimOutput("SLAWarning 3 CAUGHT",4);
+                                    // Task addition failed
                                 }
                             }
                         }
                     }
                 }
             } catch (...) {
-                SimOutput("SLAWarning 4 CAUGHT",4);
+                // Error during task movement
             }
         }
         // For SLA2, just increase priority
