@@ -54,15 +54,23 @@ bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
     if (IsVMMigrating(vm)) return false;
     try {
         VMInfo_t info = VM_GetInfo(vm);
+        if (info.machine_id == MachineId_t(-1)) return false;
+        bool taskFound = false;
         for (TaskId_t t : info.active_tasks) {
             if (t == task) {
-                VM_RemoveTask(vm, task);
-                return true;
+                taskFound = true;
+                break;
             }
+        }
+        if (!taskFound) return false;
+        if (!IsVMMigrating(vm)) {
+            VM_RemoveTask(vm, task);
+            return true;
         }
         return false;
     } 
     catch (...) {
+        SimOutput("SafeRemoveTask CAUGHT",4);
         return false;
     }
 }
@@ -79,10 +87,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         priority = HIGH_PRIORITY;
         break;
     case SLA1:
-        priority = HIGH_PRIORITY;
+        priority = MID_PRIORITY;
         break;
     case SLA2:
-        priority = MID_PRIORITY;
+        priority = LOW_PRIORITY;
         break;
     case SLA3:
     default:
@@ -113,6 +121,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     }
                 }
             } catch (...) {
+                SimOutput("NewTask 1 CAUGHT",4);
                 continue;
             }
         }
@@ -131,6 +140,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     }
                 }
             } catch (...) {
+                SimOutput("NewTask 2 CAUGHT",4);
                 continue;
             }
         }
@@ -157,6 +167,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     }
                 }
             } catch (...) {
+                SimOutput("NewTask 3 CAUGHT",4);
                 continue;
             }
         }
@@ -176,6 +187,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                         break;
                     }
                 } catch (...) {
+                    SimOutput("NewTask 4 CAUGHT",4);
                     continue;
                 }
             }
@@ -196,7 +208,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     }
                 }
             } catch (...) {
-                // VM creation failed
+                SimOutput("NewTask 5 CAUGHT",4);
             }
         }
     }
@@ -220,7 +232,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 }
             }
         } catch (...) {
-            // Task assignment failed
+            SimOutput("NewTask 6 CAUGHT",4);
         }
     }
 }
@@ -236,6 +248,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
             }
             machineUtilization[machine] = utilization;
         } catch (...) {
+            SimOutput("Periodic 1 CAUGHT",4);
             continue;
         }
     }
@@ -265,6 +278,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     
                     if (hasHighPriorityTasks) break;
                 } catch (...) {
+                    SimOutput("Periodic 2 CAUGHT",4);
                     continue;
                 }
             }
@@ -296,6 +310,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 }
             }
         } catch (...) {
+            SimOutput("Periodic 3 CAUGHT",4);
             continue;
         }
     }
@@ -310,6 +325,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     underutilizedMachines.push_back(machine);
                 }
             } catch (...) {
+                SimOutput("Periodic 4 CAUGHT",4);
                 continue;
             }
         }
@@ -340,6 +356,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                         
                         if (hasHighPriorityTasks) break;
                     } catch (...) {
+                        SimOutput("Periodic 5 CAUGHT",4);
                         continue;
                     }
                 }
@@ -372,6 +389,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                 break;
                             }
                         } catch (...) {
+                            SimOutput("Periodic 6 CAUGHT",4);
                             continue;
                         }
                     }
@@ -399,6 +417,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                         bestUtilization = machineUtilization[machine];
                                     }
                                 } catch (...) {
+                                    SimOutput("Periodic 7 CAUGHT",4);
                                     continue;
                                 }
                             }
@@ -409,13 +428,13 @@ void Scheduler::PeriodicCheck(Time_t now) {
                                 VM_Migrate(vmToMigrate, targetMachine);
                             }
                         } catch (...) {
-                            // Migration failed, reset state
+                            SimOutput("Periodic 8 CAUGHT",4);
                             MarkVMAsReady(vmToMigrate);
                         }
                     }
                 }
             } catch (...) {
-                // Error accessing source machine
+                SimOutput("Periodic 9 CAUGHT",4);
             }
         }
     }
@@ -432,6 +451,7 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             }
             machineUtilization[machine] = utilization;
         } catch (...) {
+            SimOutput("Task Complete 1 CAUGHT",4);
             continue;
         }
     }
@@ -446,7 +466,7 @@ void Scheduler::Shutdown(Time_t time) {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // This method is called by MigrationDone
+    MarkVMAsReady(vm_id);
 }
 
 void InitScheduler() {
@@ -481,6 +501,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                     vmTaskCount[vm] = vmInfo.active_tasks.size();
                 }
             } catch (...) {
+                SimOutput("MemoryWarning 1 CAUGHT",4);
                 continue;
             }
         }
@@ -518,7 +539,8 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 for (MachineId_t machine : scheduler.GetMachines()) {
                     if (machine == machine_id) continue;
                     if (!scheduler.IsMachineActive(machine)) continue;
-                    
+                    MachineInfo_t info = Machine_GetInfo(machine);
+                    if (info.s_state != S0) continue;
                     try {
                         MachineInfo_t info = Machine_GetInfo(machine);
                         if (info.cpu != vmCpuType) continue;
@@ -534,6 +556,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                             break;
                         }
                     } catch (...) {
+                        SimOutput("MemoryWarning 2 CAUGHT",4);
                         continue;
                     }
                 }
@@ -542,7 +565,8 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 if (targetMachine == MachineId_t(-1)) {
                     for (MachineId_t machine : scheduler.GetMachines()) {
                         if (scheduler.IsMachineActive(machine)) continue;
-                        
+                        MachineInfo_t info = Machine_GetInfo(machine);
+                        if (info.s_state != S0) continue;
                         try {
                             MachineInfo_t info = Machine_GetInfo(machine);
                             if (info.cpu != vmCpuType) continue;
@@ -552,6 +576,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                             targetMachine = machine;
                             break;
                         } catch (...) {
+                            SimOutput("MemoryWarning 3 CAUGHT",4);
                             continue;
                         }
                     }
@@ -565,18 +590,20 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                     // If migration not possible, power on another machine as a last resort
                     for (MachineId_t machine : scheduler.GetMachines()) {
                         if (scheduler.IsMachineActive(machine)) continue;
-                        
+                        MachineInfo_t info = Machine_GetInfo(machine);
+                        if (info.s_state != S0) continue;
                         try {
                             Machine_SetState(machine, S0);
                             scheduler.ActivateMachine(machine);
                             break;
                         } catch (...) {
+                            SimOutput("MemoryWarning 4 CAUGHT",4);
                             continue;
                         }
                     }
                 }
             } catch (...) {
-                // Error during migration
+                SimOutput("MemoryWarning 5 CAUGHT",4);
                 scheduler.MarkVMAsReady(largestVM);
             }
         }
@@ -586,12 +613,16 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
             Machine_SetCorePerformance(machine_id, i, P0);
         }
     } catch (...) {
-        // Error accessing machine info
+        SimOutput("MemoryWarning 6 CAUGHT",4);
     }
 }
 
+void SchedulerCheck(Time_t time) {
+    scheduler.PeriodicCheck(time);
+}
+
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    scheduler.MarkVMAsReady(vm_id);
+    SimOutput("Migration done for vm " + vm_id,4);
     scheduler.MigrationComplete(time, vm_id);
 }
 
@@ -631,6 +662,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
                         break;
                     }
                 } catch (...) {
+                    SimOutput("StateChangeComplete 1 CAUGHT",4);
                     continue;
                 }
             }
@@ -642,7 +674,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
                     VM_Attach(newVM, machine_id);
                     scheduler.AddVM(newVM);
                 } catch (...) {
-                    // VM creation failed
+                    SimOutput("StateChangeComplete 2 CAUGHT",4);
                 }
             }
         }
@@ -650,7 +682,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             scheduler.DeactivateMachine(machine_id);
         }
     } catch (...) {
-        // Error accessing machine info
+        SimOutput("StateChangeComplete 3 CAUGHT",4);
     }
     
     // Run periodic check to update system state
@@ -669,6 +701,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
         
         try {
             VMInfo_t vmInfo = VM_GetInfo(vm);
+            if (vmInfo.machine_id == MachineId_t(-1)) continue;
             for (TaskId_t task : vmInfo.active_tasks) {
                 if (task == task_id) {
                     taskVM = vm;
@@ -679,6 +712,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
             
             if (taskVM != VMId_t(-1)) break;
         } catch (...) {
+            SimOutput("SLAWarning 1 CAUGHT",4);
             continue;
         }
     }
@@ -697,13 +731,41 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                     Machine_SetCorePerformance(taskMachine, i, P0);
                 }
                 
-                // Move other tasks away from this VM if possible
-                VMInfo_t vmInfo = VM_GetInfo(taskVM);
-                for (TaskId_t otherTask : vmInfo.active_tasks) {
-                    if (otherTask == task_id) continue;
+                if (!scheduler.IsVMMigrating(taskVM)) {
+
+                    // Move other tasks away from this VM if possible
+
+                    VMInfo_t vmInfo = VM_GetInfo(taskVM);
+
                     
-                    SLAType_t otherSlaType = RequiredSLA(otherTask);
-                    if (otherSlaType != SLA0 && otherSlaType != SLA1) {
+
+                    std::vector<TaskId_t> tasksToMove;
+
+                    for (TaskId_t otherTask : vmInfo.active_tasks) {
+
+                        if (otherTask == task_id) continue;
+
+                        
+
+                        SLAType_t otherSlaType = RequiredSLA(otherTask);
+
+                        if (otherSlaType != SLA0 && otherSlaType != SLA1) {
+
+                            tasksToMove.push_back(otherTask);
+
+                        }
+
+                    }
+
+                    
+
+                    // Process one task at a time
+
+                    if (!tasksToMove.empty()) {
+
+                        TaskId_t otherTask = tasksToMove[0];
+
+                        
                         // Find another VM for this lower-priority task
                         VMId_t targetVM = VMId_t(-1);
                         
@@ -712,11 +774,13 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                             
                             try {
                                 VMInfo_t otherVMInfo = VM_GetInfo(vm);
+                                if (otherVMInfo.machine_id == MachineId_t(-1)) continue;
                                 if (otherVMInfo.cpu == vmInfo.cpu && otherVMInfo.active_tasks.size() < 3) {
                                     targetVM = vm;
                                     break;
                                 }
                             } catch (...) {
+                                SimOutput("SLAWarning 2 CAUGHT",4);
                                 continue;
                             }
                         }
@@ -724,14 +788,19 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                         // Move the task if a suitable VM was found
                         if (targetVM != VMId_t(-1)) {
                             if (scheduler.SafeRemoveTask(taskVM, otherTask)) {
-                                VM_AddTask(targetVM, otherTask, MID_PRIORITY);
-                                break; // Just move one task for now
+                                try {
+
+                                    VM_AddTask(targetVM, otherTask, MID_PRIORITY);
+
+                                } catch (...) {
+                                    SimOutput("SLAWarning 3 CAUGHT",4);
+                                }
                             }
                         }
                     }
                 }
             } catch (...) {
-                // Error during task movement
+                SimOutput("SLAWarning 4 CAUGHT",4);
             }
         }
         // For SLA2, just increase priority
