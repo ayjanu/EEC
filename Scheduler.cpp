@@ -2,6 +2,7 @@
 //  Scheduler.cpp
 //  CloudSim
 //
+
 #include "Scheduler.hpp"
 #include <string>
 #include <chrono>
@@ -17,8 +18,6 @@ void Scheduler::Init() {
     migratingVMs.clear();
     unsigned totalMachines = Machine_GetTotal();
     std::map<CPUType_t, std::vector<MachineId_t>> machinesByCPU;
-    
-    // Categorize machines by CPU type
     for (unsigned i = 0; i < totalMachines; i++) {
         MachineId_t machineId = MachineId_t(i);
         machines.push_back(machineId);
@@ -27,13 +26,14 @@ void Scheduler::Init() {
         machinesByCPU[cpuType].push_back(machineId);
     }
     
-    // Create VMs for each CPU type
+    // Create more VMs initially to handle the workload better
     for (const auto &pair : machinesByCPU) {
         CPUType_t cpuType = pair.first;
         const std::vector<MachineId_t> &machinesWithCPU = pair.second;
         if (machinesWithCPU.empty()) continue;
         
-        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 4u);
+        // Create more VMs initially - up to 8 per CPU type
+        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 8u);
         for (unsigned i = 0; i < numVMsToCreate; i++) {
             VMId_t vm = VM_Create(LINUX, cpuType);
             vms.push_back(vm);
@@ -44,10 +44,9 @@ void Scheduler::Init() {
         }
     }
     
-    // Power down unused machines
+    // Power down unused machines to save energy
     for (MachineId_t machine : machines) {
-        if (activeMachines.find(machine) == activeMachines.end()) 
-            Machine_SetState(machine, S5);
+        if (activeMachines.find(machine) == activeMachines.end()) Machine_SetState(machine, S5);
     }
 }
 
@@ -73,13 +72,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     VMType_t required_vm = RequiredVMType(task_id);
     SLAType_t sla_type = RequiredSLA(task_id);
     
+    // Prioritize SLA0 and SLA1 tasks with HIGH_PRIORITY
     Priority_t priority;
     switch (sla_type) {
     case SLA0:
         priority = HIGH_PRIORITY;
         break;
     case SLA1:
-        priority = MID_PRIORITY;
+        priority = HIGH_PRIORITY;
         break;
     case SLA2:
         priority = MID_PRIORITY;
@@ -90,113 +90,113 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         break;
     }
     
+    // Find the best VM for this task
     VMId_t target_vm = VMId_t(-1);
+    unsigned lowest_task_count = UINT_MAX;
     
-    // For SLA0 tasks, try to find a VM with only SLA0 tasks or no tasks
-    if (sla_type == SLA0) {
+    // For SLA0 and SLA1, find VM with fewest tasks
+    if (sla_type == SLA0 || sla_type == SLA1) {
         for (VMId_t vm : vms) {
             if (IsVMMigrating(vm)) continue;
             
-            VMInfo_t info = VM_GetInfo(vm);
-            if (info.cpu != required_cpu) continue;
-            
-            // Check if VM has only SLA0 tasks
-            bool onlySLA0Tasks = true;
-            for (TaskId_t existingTask : info.active_tasks) {
-                if (RequiredSLA(existingTask) != SLA0) {
-                    onlySLA0Tasks = false;
-                    break;
+            try {
+                VMInfo_t info = VM_GetInfo(vm);
+                if (info.cpu == required_cpu) {
+                    // Prefer empty VMs for high-priority tasks
+                    if (info.active_tasks.empty()) {
+                        target_vm = vm;
+                        break;
+                    }
+                    else if (info.active_tasks.size() < lowest_task_count) {
+                        lowest_task_count = info.active_tasks.size();
+                        target_vm = vm;
+                    }
                 }
-            }
-            
-            if (onlySLA0Tasks) {
-                // Prefer VMs with fewer tasks
-                if (target_vm == VMId_t(-1) || info.active_tasks.size() < VM_GetInfo(target_vm).active_tasks.size()) {
-                    target_vm = vm;
-                }
+            } catch (...) {
+                continue;
             }
         }
-    }
-    
-    // If no dedicated VM found for SLA0 or for other SLA types, use regular approach
-    if (target_vm == VMId_t(-1)) {
-        unsigned lowest_task_count = UINT_MAX;
+    } 
+    // For other SLA types, find any suitable VM
+    else {
         for (VMId_t vm : vms) {
             if (IsVMMigrating(vm)) continue;
             
-            VMInfo_t info = VM_GetInfo(vm);
-            if (info.cpu == required_cpu) {
-                if (sla_type == SLA0) {
+            try {
+                VMInfo_t info = VM_GetInfo(vm);
+                if (info.cpu == required_cpu) {
                     if (info.active_tasks.size() < lowest_task_count) {
                         lowest_task_count = info.active_tasks.size();
                         target_vm = vm;
                     }
-                } else {
-                    target_vm = vm;
-                    break;
                 }
+            } catch (...) {
+                continue;
             }
         }
     }
     
-    // If still no suitable VM, create a new one
+    // If no suitable VM found, create a new one
     if (target_vm == VMId_t(-1)) {
         MachineId_t target_machine = MachineId_t(-1);
         
-        // For SLA0, try to find a machine with low utilization
-        if (sla_type == SLA0) {
-            double lowest_util = 1.0;
-            for (MachineId_t machine : activeMachines) {
-                MachineInfo_t info = Machine_GetInfo(machine);
-                if (info.cpu != required_cpu) continue;
-                
-                double util = machineUtilization[machine];
-                if (util < lowest_util) {
-                    lowest_util = util;
-                    target_machine = machine;
-                }
-            }
-        }
-        
-        // If no suitable machine found or not SLA0, use regular approach
-        if (target_machine == MachineId_t(-1)) {
-            for (MachineId_t machine : activeMachines) {
+        // First check active machines with the required CPU
+        for (MachineId_t machine : activeMachines) {
+            try {
                 MachineInfo_t info = Machine_GetInfo(machine);
                 if (info.cpu == required_cpu) {
-                    target_machine = machine;
-                    break;
+                    // For SLA0/SLA1, prefer machines with fewer tasks
+                    if (sla_type == SLA0 || sla_type == SLA1) {
+                        if (info.active_tasks < 2) {
+                            target_machine = machine;
+                            break;
+                        }
+                    } else {
+                        target_machine = machine;
+                        break;
+                    }
                 }
+            } catch (...) {
+                continue;
             }
         }
         
-        // If still no suitable machine, power on a new one
+        // If no suitable active machine, power on an inactive one
         if (target_machine == MachineId_t(-1)) {
             for (MachineId_t machine : machines) {
                 if (activeMachines.find(machine) != activeMachines.end()) continue;
                 
-                MachineInfo_t info = Machine_GetInfo(machine);
-                if (info.cpu == required_cpu) {
-                    Machine_SetState(machine, S0);
-                    activeMachines.insert(machine);
-                    machineUtilization[machine] = 0.0;
-                    target_machine = machine;
-                    break;
+                try {
+                    MachineInfo_t info = Machine_GetInfo(machine);
+                    if (info.cpu == required_cpu) {
+                        Machine_SetState(machine, S0);
+                        activeMachines.insert(machine);
+                        machineUtilization[machine] = 0.0;
+                        target_machine = machine;
+                        break;
+                    }
+                } catch (...) {
+                    continue;
                 }
             }
         }
         
         // Create a new VM on the target machine
         if (target_machine != MachineId_t(-1)) {
-            target_vm = VM_Create(required_vm, required_cpu);
-            VM_Attach(target_vm, target_machine);
-            vms.push_back(target_vm);
-            
-            // For SLA0, set all cores to maximum performance immediately
-            if (sla_type == SLA0) {
-                MachineInfo_t machineInfo = Machine_GetInfo(target_machine);
-                for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-                    Machine_SetCorePerformance(target_machine, i, P0);
+            try {
+                target_vm = VM_Create(required_vm, required_cpu);
+                VM_Attach(target_vm, target_machine);
+                vms.push_back(target_vm);
+                
+                // For SLA0/SLA1, set cores to maximum performance immediately
+                if (sla_type == SLA0 || sla_type == SLA1) {
+                    MachineInfo_t machineInfo = Machine_GetInfo(target_machine);
+                    for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
+                        Machine_SetCorePerformance(target_machine, i, P0);
+                    }
                 }
+            } catch (...) {
+                // VM creation failed
             }
         }
     }
@@ -204,38 +204,23 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Assign task to VM
     if (target_vm != VMId_t(-1)) {
         if (IsVMMigrating(target_vm)) return;
-        VM_AddTask(target_vm, task_id, priority);
-    }
-}
-
-void Scheduler::OptimizeForSLA0Tasks() {
-    // Find all machines with SLA0 tasks
-    std::set<MachineId_t> machinesWithSLA0;
-    
-    for (VMId_t vm : vms) {
-        if (IsVMMigrating(vm)) continue;
         
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-        bool hasSLA0 = false;
-        
-        for (TaskId_t task : vmInfo.active_tasks) {
-            if (RequiredSLA(task) == SLA0) {
-                hasSLA0 = true;
-                break;
+        try {
+            VMInfo_t info = VM_GetInfo(target_vm);
+            if (info.machine_id == MachineId_t(-1)) return;
+            
+            VM_AddTask(target_vm, task_id, priority);
+            
+            // For SLA0/SLA1, ensure the machine is at maximum performance
+            if (sla_type == SLA0 || sla_type == SLA1) {
+                MachineId_t machine = info.machine_id;
+                MachineInfo_t machineInfo = Machine_GetInfo(machine);
+                for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
+                    Machine_SetCorePerformance(machine, i, P0);
+                }
             }
-        }
-        
-        if (hasSLA0) {
-            machinesWithSLA0.insert(vmInfo.machine_id);
-        }
-    }
-    
-    // Set all cores to maximum performance on machines with SLA0 tasks
-    for (MachineId_t machine : machinesWithSLA0) {
-        MachineInfo_t info = Machine_GetInfo(machine);
-        
-        for (unsigned i = 0; i < info.num_cpus; i++) {
-            Machine_SetCorePerformance(machine, i, P0);
+        } catch (...) {
+            // Task assignment failed
         }
     }
 }
@@ -243,145 +228,194 @@ void Scheduler::OptimizeForSLA0Tasks() {
 void Scheduler::PeriodicCheck(Time_t now) {
     // Update machine utilization
     for (MachineId_t machine : machines) {
-        MachineInfo_t info = Machine_GetInfo(machine);
-        double utilization = 0.0;
-        if (info.num_cpus > 0)
-            utilization = static_cast<double>(info.active_tasks) / info.num_cpus;
-        machineUtilization[machine] = utilization;
-    }
-    
-    // Optimize for SLA0 tasks
-    OptimizeForSLA0Tasks();
-    
-    // Set performance states for machines without SLA0 tasks
-    for (MachineId_t machine : machines) {
-        MachineInfo_t info = Machine_GetInfo(machine);
-        
-        // Check if this machine has any SLA0 tasks
-        bool hasSLA0 = false;
-        for (VMId_t vm : vms) {
-            if (IsVMMigrating(vm)) continue;
-            
-            VMInfo_t vmInfo = VM_GetInfo(vm);
-            if (vmInfo.machine_id != machine) continue;
-            
-            for (TaskId_t task : vmInfo.active_tasks) {
-                if (RequiredSLA(task) == SLA0) {
-                    hasSLA0 = true;
-                    break;
-                }
+        try {
+            MachineInfo_t info = Machine_GetInfo(machine);
+            double utilization = 0.0;
+            if (info.num_cpus > 0) {
+                utilization = static_cast<double>(info.active_tasks) / info.num_cpus;
             }
-            
-            if (hasSLA0) break;
-        }
-        
-        // Only adjust performance for machines without SLA0 tasks
-        if (!hasSLA0) {
-            if (info.active_tasks > 0) {
-                for (unsigned i = 0; i < info.num_cpus; i++)
-                    Machine_SetCorePerformance(machine, i, P0);
-            } else {
-                for (unsigned i = 0; i < info.num_cpus; i++)
-                    Machine_SetCorePerformance(machine, i, P3);
-            }
+            machineUtilization[machine] = utilization;
+        } catch (...) {
+            continue;
         }
     }
     
-    // Monitor SLA0 tasks to prevent violations
-    MonitorSLA0Tasks(now);
-    
-    // VM consolidation (only after initial startup phase)
-    if (now > 1000000) {
-        std::vector<MachineId_t> underutilizedMachines;
-        for (MachineId_t machine : activeMachines) {
-            if (machineUtilization[machine] < UNDERLOAD_THRESHOLD) {
-                // Check if this machine has any SLA0 tasks
-                bool hasSLA0 = false;
-                for (VMId_t vm : vms) {
-                    if (IsVMMigrating(vm)) continue;
-                    
+    // Adjust CPU performance based on load and SLA
+    for (MachineId_t machine : activeMachines) {
+        try {
+            MachineInfo_t info = Machine_GetInfo(machine);
+            
+            // Check for SLA0/SLA1 tasks on this machine
+            bool hasHighPriorityTasks = false;
+            
+            for (VMId_t vm : vms) {
+                if (IsVMMigrating(vm)) continue;
+                
+                try {
                     VMInfo_t vmInfo = VM_GetInfo(vm);
                     if (vmInfo.machine_id != machine) continue;
                     
                     for (TaskId_t task : vmInfo.active_tasks) {
-                        if (RequiredSLA(task) == SLA0) {
-                            hasSLA0 = true;
+                        SLAType_t slaType = RequiredSLA(task);
+                        if (slaType == SLA0 || slaType == SLA1) {
+                            hasHighPriorityTasks = true;
                             break;
                         }
                     }
                     
-                    if (hasSLA0) break;
+                    if (hasHighPriorityTasks) break;
+                } catch (...) {
+                    continue;
                 }
-                
-                // Only consider consolidating machines without SLA0 tasks
-                if (!hasSLA0) {
+            }
+            
+            // Set CPU performance based on tasks
+            if (hasHighPriorityTasks) {
+                // Maximum performance for machines with high-priority tasks
+                for (unsigned i = 0; i < info.num_cpus; i++) {
+                    Machine_SetCorePerformance(machine, i, P0);
+                }
+            }
+            else if (info.active_tasks > 0) {
+                // For machines with only lower-priority tasks, use P0 if utilization is high
+                if (machineUtilization[machine] > 0.5) {
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machine, i, P0);
+                    }
+                } else {
+                    // Use P1 for moderate utilization
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machine, i, P1);
+                    }
+                }
+            }
+            else {
+                // No active tasks, use lowest performance
+                for (unsigned i = 0; i < info.num_cpus; i++) {
+                    Machine_SetCorePerformance(machine, i, P3);
+                }
+            }
+        } catch (...) {
+            continue;
+        }
+    }
+    
+    // Skip VM consolidation if there are any migrations in progress
+    if (now > 1000000 && migratingVMs.empty()) {
+        // Identify underutilized machines
+        std::vector<MachineId_t> underutilizedMachines;
+        for (MachineId_t machine : activeMachines) {
+            try {
+                if (machineUtilization[machine] < UNDERLOAD_THRESHOLD) {
                     underutilizedMachines.push_back(machine);
                 }
+            } catch (...) {
+                continue;
             }
         }
         
+        // Process one underutilized machine at a time
         if (!underutilizedMachines.empty()) {
             MachineId_t sourceMachine = underutilizedMachines[0];
-            MachineInfo_t sourceInfo = Machine_GetInfo(sourceMachine);
             
-            if (sourceInfo.active_vms > 0) {
-                VMId_t vmToMigrate = VMId_t(-1);
+            try {
+                MachineInfo_t sourceInfo = Machine_GetInfo(sourceMachine);
                 
-                // Find a VM without SLA0 tasks
+                // Check if this machine has any high-priority tasks
+                bool hasHighPriorityTasks = false;
                 for (VMId_t vm : vms) {
                     if (IsVMMigrating(vm)) continue;
                     
-                    VMInfo_t vmInfo = VM_GetInfo(vm);
-                    if (vmInfo.machine_id != sourceMachine) continue;
-                    
-                    bool hasSLA0 = false;
-                    for (TaskId_t task : vmInfo.active_tasks) {
-                        if (RequiredSLA(task) == SLA0) {
-                            hasSLA0 = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!hasSLA0) {
-                        vmToMigrate = vm;
-                        break;
-                    }
-                }
-                
-                // If no VM without SLA0 tasks found, use any VM
-                if (vmToMigrate == VMId_t(-1)) {
-                    for (VMId_t vm : vms) {
+                    try {
                         VMInfo_t vmInfo = VM_GetInfo(vm);
-                        if (vmInfo.machine_id == sourceMachine) {
-                            vmToMigrate = vm;
-                            break;
+                        if (vmInfo.machine_id != sourceMachine) continue;
+                        
+                        for (TaskId_t task : vmInfo.active_tasks) {
+                            SLAType_t slaType = RequiredSLA(task);
+                            if (slaType == SLA0 || slaType == SLA1) {
+                                hasHighPriorityTasks = true;
+                                break;
+                            }
                         }
+                        
+                        if (hasHighPriorityTasks) break;
+                    } catch (...) {
+                        continue;
                     }
                 }
                 
-                if (vmToMigrate != VMId_t(-1) && !IsVMMigrating(vmToMigrate)) {
-                    VMInfo_t vmInfo = VM_GetInfo(vmToMigrate);
-                    CPUType_t vmCpuType = vmInfo.cpu;
-                    MachineId_t targetMachine = MachineId_t(-1);
-                    double bestUtilization = 0.0;
+                // Skip migration if this machine has high-priority tasks
+                if (!hasHighPriorityTasks && sourceInfo.active_vms > 0) {
+                    // Find a VM to migrate
+                    VMId_t vmToMigrate = VMId_t(-1);
                     
-                    for (MachineId_t machine : activeMachines) {
-                        if (machine == sourceMachine) continue;
+                    for (VMId_t vm : vms) {
+                        if (IsVMMigrating(vm)) continue;
                         
-                        MachineInfo_t machineInfo = Machine_GetInfo(machine);
-                        if (machineInfo.cpu == vmCpuType && 
-                            machineUtilization[machine] > bestUtilization && 
-                            machineUtilization[machine] < OVERLOAD_THRESHOLD) {
-                            targetMachine = machine;
-                            bestUtilization = machineUtilization[machine];
+                        try {
+                            VMInfo_t vmInfo = VM_GetInfo(vm);
+                            if (vmInfo.machine_id != sourceMachine) continue;
+                            
+                            // Check if this VM has any high-priority tasks
+                            bool vmHasHighPriorityTasks = false;
+                            for (TaskId_t task : vmInfo.active_tasks) {
+                                SLAType_t slaType = RequiredSLA(task);
+                                if (slaType == SLA0 || slaType == SLA1) {
+                                    vmHasHighPriorityTasks = true;
+                                    break;
+                                }
+                            }
+                            
+                            // Skip VMs with high-priority tasks
+                            if (!vmHasHighPriorityTasks) {
+                                vmToMigrate = vm;
+                                break;
+                            }
+                        } catch (...) {
+                            continue;
                         }
                     }
                     
-                    if (targetMachine != MachineId_t(-1)) {
-                        MarkVMAsMigrating(vmToMigrate);
-                        VM_Migrate(vmToMigrate, targetMachine);
+                    // Migrate the VM if found
+                    if (vmToMigrate != VMId_t(-1)) {
+                        try {
+                            VMInfo_t vmInfo = VM_GetInfo(vmToMigrate);
+                            CPUType_t vmCpuType = vmInfo.cpu;
+                            
+                            // Find a suitable target machine
+                            MachineId_t targetMachine = MachineId_t(-1);
+                            double bestUtilization = 0.0;
+                            
+                            for (MachineId_t machine : activeMachines) {
+                                if (machine == sourceMachine) continue;
+                                
+                                try {
+                                    MachineInfo_t machineInfo = Machine_GetInfo(machine);
+                                    if (machineInfo.cpu == vmCpuType && 
+                                        machineUtilization[machine] > bestUtilization && 
+                                        machineUtilization[machine] < OVERLOAD_THRESHOLD) {
+                                        
+                                        targetMachine = machine;
+                                        bestUtilization = machineUtilization[machine];
+                                    }
+                                } catch (...) {
+                                    continue;
+                                }
+                            }
+                            
+                            // Perform the migration
+                            if (targetMachine != MachineId_t(-1)) {
+                                MarkVMAsMigrating(vmToMigrate);
+                                VM_Migrate(vmToMigrate, targetMachine);
+                            }
+                        } catch (...) {
+                            // Migration failed, reset state
+                            MarkVMAsReady(vmToMigrate);
+                        }
                     }
                 }
+            } catch (...) {
+                // Error accessing source machine
             }
         }
     }
@@ -390,11 +424,16 @@ void Scheduler::PeriodicCheck(Time_t now) {
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Update machine utilization
     for (MachineId_t machine : machines) {
-        MachineInfo_t info = Machine_GetInfo(machine);
-        double utilization = 0.0;
-        if (info.num_cpus > 0) 
-            utilization = static_cast<double>(info.active_tasks) / info.num_cpus;
-        machineUtilization[machine] = utilization;
+        try {
+            MachineInfo_t info = Machine_GetInfo(machine);
+            double utilization = 0.0;
+            if (info.num_cpus > 0) {
+                utilization = static_cast<double>(info.active_tasks) / info.num_cpus;
+            }
+            machineUtilization[machine] = utilization;
+        } catch (...) {
+            continue;
+        }
     }
 }
 
@@ -402,81 +441,17 @@ void Scheduler::Shutdown(Time_t time) {
     for(auto & vm: vms) {
         VM_Shutdown(vm);
     }
+    SimOutput("SimulationComplete(): Finished!", 4);
+    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
 
-void Scheduler::MonitorSLA0Tasks(Time_t now) {
-    // Find all SLA0 tasks
-    std::vector<std::pair<TaskId_t, VMId_t>> sla0Tasks;
-    
-    for (VMId_t vm : vms) {
-        if (IsVMMigrating(vm)) continue;
-        
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-        for (TaskId_t task : vmInfo.active_tasks) {
-            if (RequiredSLA(task) == SLA0) {
-                sla0Tasks.push_back(std::make_pair(task, vm));
-            }
-        }
-    }
-    
-    // For each SLA0 task, check if it's at risk
-    for (const auto& pair : sla0Tasks) {
-        TaskId_t task = pair.first;
-        VMId_t vm = pair.second;
-        
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-        MachineId_t machine = vmInfo.machine_id;
-        MachineInfo_t machineInfo = Machine_GetInfo(machine);
-        
-        // If the machine has more than 2 tasks per CPU, consider the SLA0 task at risk
-        if (machineInfo.active_tasks > machineInfo.num_cpus * 2) {
-            // Ensure this task has HIGH_PRIORITY
-            SetTaskPriority(task, HIGH_PRIORITY);
-            
-            // Set machine to maximum performance
-            for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-                Machine_SetCorePerformance(machine, i, P0);
-            }
-            
-            // If there are multiple tasks on this VM, try to move non-SLA0 tasks
-            if (vmInfo.active_tasks.size() > 1) {
-                for (TaskId_t otherTask : vmInfo.active_tasks) {
-                    if (otherTask != task && RequiredSLA(otherTask) != SLA0) {
-                        // Find another VM for this task
-                        VMId_t targetVM = VMId_t(-1);
-                        for (VMId_t otherVM : vms) {
-                            if (otherVM == vm || IsVMMigrating(otherVM)) continue;
-                            
-                            VMInfo_t otherVMInfo = VM_GetInfo(otherVM);
-                            if (otherVMInfo.cpu == vmInfo.cpu) {
-                                targetVM = otherVM;
-                                break;
-                            }
-                        }
-                        
-                        if (targetVM != VMId_t(-1)) {
-                            // Move the non-SLA0 task to another VM
-                            Priority_t priority;
-                            SLAType_t otherSlaType = RequiredSLA(otherTask);
-                            switch (otherSlaType) {
-                                case SLA1: priority = MID_PRIORITY; break;
-                                case SLA2: priority = LOW_PRIORITY; break;
-                                default: priority = LOW_PRIORITY; break;
-                            }
-                            
-                            if (SafeRemoveTask(vm, otherTask)) {
-                                VM_AddTask(targetVM, otherTask, priority);
-                                break; // Just move one task for now
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
+    // This method is called by MigrationDone
 }
 
 void InitScheduler() {
+    std::cout << "DIRECT OUTPUT: InitScheduler starting" << std::endl;
+    std::cout.flush();
     scheduler.Init();
 }
 
@@ -484,132 +459,140 @@ void HandleNewTask(Time_t time, TaskId_t task_id) {
     scheduler.NewTask(time, task_id);
 }
 
-void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
+void HandleTaskCompletion(Time_t time, TaskId_t task_id){
     scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    MachineInfo_t machineInfo = Machine_GetInfo(machine_id);
-    std::vector<VMId_t> vmsOnMachine;
-    std::map<VMId_t, unsigned> vmTaskCount;
-    
-    // Find VMs on this machine and count their tasks
-    for (VMId_t vm : scheduler.GetVMs()) {
-        if (scheduler.IsVMMigrating(vm)) continue;
+    try {
+        MachineInfo_t machineInfo = Machine_GetInfo(machine_id);
         
-        VMInfo_t vmInfo;
-        try {
-            vmInfo = VM_GetInfo(vm);
-        } catch (...) {
-            continue;
-        }
+        // Identify VMs on this machine
+        std::vector<VMId_t> vmsOnMachine;
+        std::map<VMId_t, unsigned> vmTaskCount;
         
-        if (vmInfo.machine_id == machine_id) {
-            vmsOnMachine.push_back(vm);
-            vmTaskCount[vm] = vmInfo.active_tasks.size();
-        }
-    }
-    
-    // Find VM with most tasks, prioritizing those without SLA0 tasks
-    VMId_t largestVM = VMId_t(-1);
-    unsigned mostTasks = 0;
-    
-    // First try to find a VM without SLA0 tasks
-    for (const auto &pair : vmTaskCount) {
-        VMId_t vm = pair.first;
-        unsigned taskCount = pair.second;
-        
-        if (taskCount <= mostTasks) continue;
-        
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-        bool hasSLA0 = false;
-        
-        for (TaskId_t task : vmInfo.active_tasks) {
-            if (RequiredSLA(task) == SLA0) {
-                hasSLA0 = true;
-                break;
+        for (VMId_t vm : scheduler.GetVMs()) {
+            if (scheduler.IsVMMigrating(vm)) continue;
+            
+            try {
+                VMInfo_t vmInfo = VM_GetInfo(vm);
+                if (vmInfo.machine_id == machine_id) {
+                    vmsOnMachine.push_back(vm);
+                    vmTaskCount[vm] = vmInfo.active_tasks.size();
+                }
+            } catch (...) {
+                continue;
             }
         }
         
-        if (!hasSLA0) {
-            mostTasks = taskCount;
-            largestVM = vm;
-        }
-    }
-    
-    // If no VM without SLA0 tasks found, use any VM
-    if (largestVM == VMId_t(-1)) {
+        // Find the VM with the most tasks
+        VMId_t largestVM = VMId_t(-1);
+        unsigned mostTasks = 0;
+        
         for (const auto &pair : vmTaskCount) {
             if (pair.second > mostTasks) {
                 mostTasks = pair.second;
                 largestVM = pair.first;
             }
         }
-    }
-    
-    // Migrate the selected VM
-    if (largestVM != VMId_t(-1) && !scheduler.IsVMMigrating(largestVM)) {
-        VMInfo_t vmInfo = VM_GetInfo(largestVM);
-        CPUType_t vmCpuType = vmInfo.cpu;
-        MachineId_t targetMachine = MachineId_t(-1);
         
-        // Find a suitable target machine
-        for (MachineId_t machine : scheduler.GetMachines()) {
-            if (machine == machine_id) continue;
-            if (!scheduler.IsMachineActive(machine)) continue;
-            
-            MachineInfo_t info = Machine_GetInfo(machine);
-            if (info.cpu != vmCpuType) continue;
-            
-            if (info.active_tasks < 2) { // Machine has 0 or 1 active tasks
-                targetMachine = machine;
-                break;
+        // Migrate the VM if possible
+        if (largestVM != VMId_t(-1) && !scheduler.IsVMMigrating(largestVM)) {
+            try {
+                VMInfo_t vmInfo = VM_GetInfo(largestVM);
+                CPUType_t vmCpuType = vmInfo.cpu;
+                
+                // Check for high-priority tasks
+                bool hasHighPriorityTasks = false;
+                for (TaskId_t task : vmInfo.active_tasks) {
+                    SLAType_t slaType = RequiredSLA(task);
+                    if (slaType == SLA0 || slaType == SLA1) {
+                        hasHighPriorityTasks = true;
+                        break;
+                    }
+                }
+                
+                // Find a suitable target machine
+                MachineId_t targetMachine = MachineId_t(-1);
+                
+                for (MachineId_t machine : scheduler.GetMachines()) {
+                    if (machine == machine_id) continue;
+                    if (!scheduler.IsMachineActive(machine)) continue;
+                    
+                    try {
+                        MachineInfo_t info = Machine_GetInfo(machine);
+                        if (info.cpu != vmCpuType) continue;
+                        
+                        // For VMs with high-priority tasks, prefer machines with no tasks
+                        if (hasHighPriorityTasks) {
+                            if (info.active_tasks == 0) {
+                                targetMachine = machine;
+                                break;
+                            }
+                        } else if (info.active_tasks < 2) {
+                            targetMachine = machine;
+                            break;
+                        }
+                    } catch (...) {
+                        continue;
+                    }
+                }
+                
+                // If no suitable active machine, power on a new one
+                if (targetMachine == MachineId_t(-1)) {
+                    for (MachineId_t machine : scheduler.GetMachines()) {
+                        if (scheduler.IsMachineActive(machine)) continue;
+                        
+                        try {
+                            MachineInfo_t info = Machine_GetInfo(machine);
+                            if (info.cpu != vmCpuType) continue;
+                            
+                            Machine_SetState(machine, S0);
+                            scheduler.ActivateMachine(machine);
+                            targetMachine = machine;
+                            break;
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+                }
+                
+                // Perform the migration
+                if (targetMachine != MachineId_t(-1)) {
+                    scheduler.MarkVMAsMigrating(largestVM);
+                    VM_Migrate(largestVM, targetMachine);
+                } else {
+                    // If migration not possible, power on another machine as a last resort
+                    for (MachineId_t machine : scheduler.GetMachines()) {
+                        if (scheduler.IsMachineActive(machine)) continue;
+                        
+                        try {
+                            Machine_SetState(machine, S0);
+                            scheduler.ActivateMachine(machine);
+                            break;
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+                }
+            } catch (...) {
+                // Error during migration
+                scheduler.MarkVMAsReady(largestVM);
             }
         }
         
-        // If no suitable active machine, power on a new one
-        if (targetMachine == MachineId_t(-1)) {
-            for (MachineId_t machine : scheduler.GetMachines()) {
-                if (scheduler.IsMachineActive(machine)) continue;
-                
-                MachineInfo_t info = Machine_GetInfo(machine);
-                if (info.cpu != vmCpuType) continue;
-                
-                Machine_SetState(machine, S0);
-                scheduler.ActivateMachine(machine);
-                targetMachine = machine;
-                break;
-            }
+        // Set all cores to maximum performance to help process tasks faster
+        for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
+            Machine_SetCorePerformance(machine_id, i, P0);
         }
-        
-        // Perform migration
-        if (targetMachine != MachineId_t(-1)) {
-            scheduler.MarkVMAsMigrating(largestVM);
-            VM_Migrate(largestVM, targetMachine);
-        } else {
-            // If no suitable target found, power on any machine
-            for (MachineId_t machine : scheduler.GetMachines()) {
-                if (scheduler.IsMachineActive(machine)) continue;
-                
-                Machine_SetState(machine, S0);
-                scheduler.ActivateMachine(machine);
-                break;
-            }
-        }
-    }
-    
-    // Set all cores to maximum performance to help process tasks faster
-    for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-        Machine_SetCorePerformance(machine_id, i, P0);
+    } catch (...) {
+        // Error accessing machine info
     }
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
     scheduler.MarkVMAsReady(vm_id);
-}
-
-void SchedulerCheck(Time_t time) {
-    scheduler.PeriodicCheck(time);
+    scheduler.MigrationComplete(time, vm_id);
 }
 
 void SimulationComplete(Time_t time) {
@@ -619,210 +602,141 @@ void SimulationComplete(Time_t time) {
     cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
+    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
     scheduler.Shutdown(time);
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    MachineInfo_t machineInfo = Machine_GetInfo(machine_id);
-    MachineState_t currentState = machineInfo.s_state;
-    
-    if (currentState == S0) {
-        scheduler.ActivateMachine(machine_id);
+    try {
+        MachineInfo_t machineInfo = Machine_GetInfo(machine_id);
+        MachineState_t currentState = machineInfo.s_state;
         
-        // Set initial performance state
-        for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-            Machine_SetCorePerformance(machine_id, i, P0);  // Start with high performance
-        }
-        
-        // Create a VM if none exists
-        bool hasVM = false;
-        for (VMId_t vm : scheduler.GetVMs()) {
-            if (scheduler.IsVMMigrating(vm)) continue;
+        if (currentState == S0) {
+            scheduler.ActivateMachine(machine_id);
             
-            VMInfo_t vmInfo = VM_GetInfo(vm);
-            if (vmInfo.machine_id == machine_id) {
-                hasVM = true;
-                break;
+            // Set cores to appropriate performance state
+            for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
+                Machine_SetCorePerformance(machine_id, i, P1);
+            }
+            
+            // Check if this machine already has a VM
+            bool hasVM = false;
+            for (VMId_t vm : scheduler.GetVMs()) {
+                if (scheduler.IsVMMigrating(vm)) continue;
+                
+                try {
+                    VMInfo_t vmInfo = VM_GetInfo(vm);
+                    if (vmInfo.machine_id == machine_id) {
+                        hasVM = true;
+                        break;
+                    }
+                } catch (...) {
+                    continue;
+                }
+            }
+            
+            // Create a VM if needed
+            if (!hasVM) {
+                try {
+                    VMId_t newVM = VM_Create(LINUX, machineInfo.cpu);
+                    VM_Attach(newVM, machine_id);
+                    scheduler.AddVM(newVM);
+                } catch (...) {
+                    // VM creation failed
+                }
             }
         }
-        
-        if (!hasVM) {
-            VMId_t newVM = VM_Create(LINUX, machineInfo.cpu);
-            VM_Attach(newVM, machine_id);
-            scheduler.AddVM(newVM);
+        else if (currentState == S5) {
+            scheduler.DeactivateMachine(machine_id);
         }
-    }
-    else if (currentState == S5) {
-        scheduler.DeactivateMachine(machine_id);
+    } catch (...) {
+        // Error accessing machine info
     }
     
+    // Run periodic check to update system state
     scheduler.PeriodicCheck(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SLAType_t slaType = RequiredSLA(task_id);
+    
+    // Find which VM is running this task
     VMId_t taskVM = VMId_t(-1);
     MachineId_t taskMachine = MachineId_t(-1);
     
-    // Find which VM is running this task
     for (VMId_t vm : scheduler.GetVMs()) {
         if (scheduler.IsVMMigrating(vm)) continue;
         
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-        for (TaskId_t task : vmInfo.active_tasks) {
-            if (task == task_id) {
-                taskVM = vm;
-                taskMachine = vmInfo.machine_id;
-                break;
+        try {
+            VMInfo_t vmInfo = VM_GetInfo(vm);
+            for (TaskId_t task : vmInfo.active_tasks) {
+                if (task == task_id) {
+                    taskVM = vm;
+                    taskMachine = vmInfo.machine_id;
+                    break;
+                }
             }
+            
+            if (taskVM != VMId_t(-1)) break;
+        } catch (...) {
+            continue;
         }
-        
-        if (taskVM != VMId_t(-1)) break;
     }
     
+    // Take action based on SLA type
     if (taskVM != VMId_t(-1)) {
-        if (slaType == SLA0) {
-            // For SLA0, take immediate and aggressive action
+        // For SLA0 and SLA1, take immediate action
+        if (slaType == SLA0 || slaType == SLA1) {
+            // Set task to highest priority
             SetTaskPriority(task_id, HIGH_PRIORITY);
             
-            // Set machine to maximum performance
-            MachineInfo_t machineInfo = Machine_GetInfo(taskMachine);
-            for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-                Machine_SetCorePerformance(taskMachine, i, P0);
-            }
-            
-            // If the machine is overloaded, try to reduce load
-            if (machineInfo.active_tasks > machineInfo.num_cpus) {
-                VMInfo_t vmInfo = VM_GetInfo(taskVM);
+            try {
+                // Set machine to maximum performance
+                MachineInfo_t machineInfo = Machine_GetInfo(taskMachine);
+                for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
+                    Machine_SetCorePerformance(taskMachine, i, P0);
+                }
                 
-                // First try to move other tasks away from this VM
+                // Move other tasks away from this VM if possible
+                VMInfo_t vmInfo = VM_GetInfo(taskVM);
                 for (TaskId_t otherTask : vmInfo.active_tasks) {
-                    if (otherTask == task_id || RequiredSLA(otherTask) == SLA0) continue;
+                    if (otherTask == task_id) continue;
                     
-                    // Find another VM for this task
-                    VMId_t targetVM = VMId_t(-1);
-                    for (VMId_t otherVM : scheduler.GetVMs()) {
-                        if (otherVM == taskVM || scheduler.IsVMMigrating(otherVM)) continue;
+                    SLAType_t otherSlaType = RequiredSLA(otherTask);
+                    if (otherSlaType != SLA0 && otherSlaType != SLA1) {
+                        // Find another VM for this lower-priority task
+                        VMId_t targetVM = VMId_t(-1);
                         
-                        VMInfo_t otherVMInfo = VM_GetInfo(otherVM);
-                        if (otherVMInfo.cpu == vmInfo.cpu) {
-                            targetVM = otherVM;
-                            break;
-                        }
-                    }
-                    
-                    if (targetVM != VMId_t(-1)) {
-                        // Move the non-SLA0 task to another VM
-                        Priority_t priority;
-                        SLAType_t otherSlaType = RequiredSLA(otherTask);
-                        switch (otherSlaType) {
-                            case SLA1: priority = MID_PRIORITY; break;
-                            case SLA2: priority = LOW_PRIORITY; break;
-                            default: priority = LOW_PRIORITY; break;
+                        for (VMId_t vm : scheduler.GetVMs()) {
+                            if (vm == taskVM || scheduler.IsVMMigrating(vm)) continue;
+                            
+                            try {
+                                VMInfo_t otherVMInfo = VM_GetInfo(vm);
+                                if (otherVMInfo.cpu == vmInfo.cpu && otherVMInfo.active_tasks.size() < 3) {
+                                    targetVM = vm;
+                                    break;
+                                }
+                            } catch (...) {
+                                continue;
+                            }
                         }
                         
-                        if (scheduler.SafeRemoveTask(taskVM, otherTask)) {
-                            VM_AddTask(targetVM, otherTask, priority);
-                            break;
+                        // Move the task if a suitable VM was found
+                        if (targetVM != VMId_t(-1)) {
+                            if (scheduler.SafeRemoveTask(taskVM, otherTask)) {
+                                VM_AddTask(targetVM, otherTask, MID_PRIORITY);
+                                break; // Just move one task for now
+                            }
                         }
                     }
                 }
-                
-                // If still overloaded, try to migrate this VM
-                MachineInfo_t updatedInfo = Machine_GetInfo(taskMachine);
-                if (updatedInfo.active_tasks > updatedInfo.num_cpus) {
-                    CPUType_t vmCpuType = vmInfo.cpu;
-                    MachineId_t targetMachine = MachineId_t(-1);
-                    
-                    // Find a less loaded machine
-                    for (MachineId_t machine : scheduler.GetMachines()) {
-                        if (machine == taskMachine) continue;
-                        if (!scheduler.IsMachineActive(machine)) continue;
-                        
-                        MachineInfo_t info = Machine_GetInfo(machine);
-                        if (info.cpu != vmCpuType) continue;
-                        
-                        if (info.active_tasks < machineInfo.active_tasks / 2) {
-                            targetMachine = machine;
-                            break;
-                        }
-                    }
-                    
-                    // If no suitable active machine, power on a new one
-                    if (targetMachine == MachineId_t(-1)) {
-                        for (MachineId_t machine : scheduler.GetMachines()) {
-                            if (scheduler.IsMachineActive(machine)) continue;
-                            
-                            MachineInfo_t info = Machine_GetInfo(machine);
-                            if (info.cpu != vmCpuType) continue;
-                            
-                            Machine_SetState(machine, S0);
-                            scheduler.ActivateMachine(machine);
-                            targetMachine = machine;
-                            break;
-                        }
-                    }
-                    
-                    // Perform migration
-                    if (targetMachine != MachineId_t(-1)) {
-                        scheduler.MarkVMAsMigrating(taskVM);
-                        VM_Migrate(taskVM, targetMachine);
-                    }
-                }
+            } catch (...) {
+                // Error during task movement
             }
         }
-        else if (slaType == SLA1) {
-            // For SLA1, take action but less aggressive than SLA0
-            SetTaskPriority(task_id, HIGH_PRIORITY);
-            
-            MachineInfo_t machineInfo = Machine_GetInfo(taskMachine);
-            for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
-                Machine_SetCorePerformance(taskMachine, i, P0);
-            }
-            
-            // Only migrate if severely overloaded
-            if (machineInfo.active_tasks > machineInfo.num_cpus * 2) {
-                // Migration logic similar to SLA0 but with higher threshold
-                VMInfo_t vmInfo = VM_GetInfo(taskVM);
-                CPUType_t vmCpuType = vmInfo.cpu;
-                MachineId_t targetMachine = MachineId_t(-1);
-                
-                for (MachineId_t machine : scheduler.GetMachines()) {
-                    if (machine == taskMachine) continue;
-                    if (!scheduler.IsMachineActive(machine)) continue;
-                    
-                    MachineInfo_t info = Machine_GetInfo(machine);
-                    if (info.cpu != vmCpuType) continue;
-                    
-                    if (info.active_tasks < machineInfo.active_tasks / 2) {
-                        targetMachine = machine;
-                        break;
-                    }
-                }
-                
-                if (targetMachine == MachineId_t(-1)) {
-                    for (MachineId_t machine : scheduler.GetMachines()) {
-                        if (scheduler.IsMachineActive(machine)) continue;
-                        
-                        MachineInfo_t info = Machine_GetInfo(machine);
-                        if (info.cpu != vmCpuType) continue;
-                        
-                        Machine_SetState(machine, S0);
-                        scheduler.ActivateMachine(machine);
-                        targetMachine = machine;
-                        break;
-                    }
-                }
-                
-                if (targetMachine != MachineId_t(-1)) {
-                    scheduler.MarkVMAsMigrating(taskVM);
-                    VM_Migrate(taskVM, targetMachine);
-                }
-            }
-        }
+        // For SLA2, just increase priority
         else if (slaType == SLA2) {
-            // For SLA2, just increase priority
-            SetTaskPriority(task_id, HIGH_PRIORITY);
+            SetTaskPriority(task_id, MID_PRIORITY);
         }
     }
 }
