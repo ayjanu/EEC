@@ -66,189 +66,169 @@ void HandleTaskCompletion(Time_t time, TaskId_t task_id)
     // LogMessage("HandleTaskCompletion(): Task completion processed", 2);
 }
 
-void MemoryWarning(Time_t time, MachineId_t machine_id)
-{
-    LogMessage("MemoryWarning(): Memory overflow detected on machine " +
-                   to_string(machine_id) + " at time " + to_string(time),
-               1);
-
+void MemoryWarning(Time_t time, MachineId_t machine_id) {
+    LogMessage("MemoryWarning(): Memory overflow detected on machine " + 
+              to_string(machine_id) + " at time " + to_string(time), 1);
+    
     // Get machine information
     MachineInfo_t machineInfo = Machine_GetInfo(machine_id);
-
+    
     // Log detailed memory information
-    LogMessage("MemoryWarning(): Machine " + to_string(machine_id) +
-                   " memory usage is critical",
-               2);
-
+    LogMessage("MemoryWarning(): Machine " + to_string(machine_id) + 
+              " memory usage is critical", 2);
+    
     // 1. First approach: Find VMs on this machine
     std::vector<VMId_t> vmsOnMachine;
     std::map<VMId_t, unsigned> vmTaskCount;
-
-    for (VMId_t vm : scheduler.GetVMs())
-    {
-        VMInfo_t vmInfo = VM_GetInfo(vm);
-
-        if (vmInfo.machine_id == machine_id)
-        {
+    
+    for (VMId_t vm : scheduler.GetVMs()) {
+        // Skip VMs that are currently migrating
+        if (scheduler.IsVMMigrating(vm)) {
+            LogMessage("MemoryWarning(): Skipping VM " + to_string(vm) + 
+                      " as it is currently migrating", 3);
+            continue;
+        }
+        
+        VMInfo_t vmInfo;
+        try {
+            vmInfo = VM_GetInfo(vm);
+        } catch (...) {
+            LogMessage("MemoryWarning(): Cannot get info for VM " + 
+                      to_string(vm) + ", skipping", 3);
+            continue;
+        }
+        
+        if (vmInfo.machine_id == machine_id) {
             vmsOnMachine.push_back(vm);
             vmTaskCount[vm] = vmInfo.active_tasks.size();
-
-            LogMessage("MemoryWarning(): VM " + to_string(vm) +
-                           " has " + to_string(vmInfo.active_tasks.size()) +
-                           " active tasks",
-                       2);
+            
+            LogMessage("MemoryWarning(): VM " + to_string(vm) + 
+                      " has " + to_string(vmInfo.active_tasks.size()) + 
+                      " active tasks", 2);
         }
     }
-
+    
     // 2. Identify the VM with the most tasks (as a proxy for memory usage)
     VMId_t largestVM = VMId_t(-1);
     unsigned mostTasks = 0;
-
-    for (const auto &pair : vmTaskCount)
-    {
-        if (pair.second > mostTasks)
-        {
+    
+    for (const auto &pair : vmTaskCount) {
+        if (pair.second > mostTasks) {
             mostTasks = pair.second;
             largestVM = pair.first;
         }
     }
-
+    
     // 3. Try to migrate the VM with the most tasks to another machine
-    if (largestVM != VMId_t(-1))
-    {
-        LogMessage("MemoryWarning(): Attempting to migrate VM " +
-                       to_string(largestVM) + " with " + to_string(mostTasks) +
-                       " tasks",
-                   1);
-
+    if (largestVM != VMId_t(-1) && !scheduler.IsVMMigrating(largestVM)) {
+        LogMessage("MemoryWarning(): Attempting to migrate VM " + 
+                  to_string(largestVM) + " with " + to_string(mostTasks) + 
+                  " tasks", 1);
+        
         VMInfo_t vmInfo = VM_GetInfo(largestVM);
         CPUType_t vmCpuType = vmInfo.cpu;
-
+        
         // Find a suitable target machine
         MachineId_t targetMachine = MachineId_t(-1);
-
-        for (MachineId_t machine : scheduler.GetMachines())
-        {
+        
+        for (MachineId_t machine : scheduler.GetMachines()) {
             // Skip the current machine
-            if (machine == machine_id)
-                continue;
-
+            if (machine == machine_id) continue;
+            
             // Skip machines that are powered off
-            if (scheduler.IsMachineActive(machine) == false)
-                continue;
-
+            if (scheduler.IsMachineActive(machine) == false) continue;
+            
             MachineInfo_t info = Machine_GetInfo(machine);
-
+            
             // Check CPU compatibility
-            if (info.cpu != vmCpuType)
-                continue;
-
+            if (info.cpu != vmCpuType) continue;
+            
             // Check if the machine has few or no tasks
-            if (info.active_tasks < 2)
-            { // Machine has 0 or 1 active tasks
+            if (info.active_tasks < 2) { // Machine has 0 or 1 active tasks
                 targetMachine = machine;
-                LogMessage("MemoryWarning(): Found suitable target machine " +
-                               to_string(targetMachine) + " with " +
-                               to_string(info.active_tasks) + " active tasks",
-                           2);
+                LogMessage("MemoryWarning(): Found suitable target machine " + 
+                          to_string(targetMachine) + " with " + 
+                          to_string(info.active_tasks) + " active tasks", 2);
                 break;
             }
         }
-
+        
         // If no suitable active machine, try to power on a machine
-        if (targetMachine == MachineId_t(-1))
-        {
-            for (MachineId_t machine : scheduler.GetMachines())
-            {
+        if (targetMachine == MachineId_t(-1)) {
+            for (MachineId_t machine : scheduler.GetMachines()) {
                 // Skip active machines
-                if (scheduler.IsMachineActive(machine))
-                    continue;
-
+                if (scheduler.IsMachineActive(machine)) continue;
+                
                 MachineInfo_t info = Machine_GetInfo(machine);
-
+                
                 // Check CPU compatibility
-                if (info.cpu != vmCpuType)
-                    continue;
-
+                if (info.cpu != vmCpuType) continue;
+                
                 // Power on the machine
-                LogMessage("MemoryWarning(): Powering on machine " +
-                               to_string(machine) + " for VM migration",
-                           1);
-
+                LogMessage("MemoryWarning(): Powering on machine " + 
+                          to_string(machine) + " for VM migration", 1);
+                
                 Machine_SetState(machine, S0);
                 scheduler.ActivateMachine(machine);
-
+                
                 targetMachine = machine;
                 break;
             }
         }
-
+        
         // Perform the migration if a target was found
-        if (targetMachine != MachineId_t(-1))
-        {
-            LogMessage("MemoryWarning(): Migrating VM " + to_string(largestVM) +
-                           " from machine " + to_string(machine_id) +
-                           " to machine " + to_string(targetMachine),
-                       1);
+        if (targetMachine != MachineId_t(-1)) {
+            LogMessage("MemoryWarning(): Migrating VM " + to_string(largestVM) + 
+                      " from machine " + to_string(machine_id) + 
+                      " to machine " + to_string(targetMachine), 1);
+            
             scheduler.MarkVMAsMigrating(largestVM);
             VM_Migrate(largestVM, targetMachine);
-        }
-        else
-        {
-            LogMessage("MemoryWarning(): No suitable target machine found for VM migration", 1);
-
-            // 4. If migration is not possible, try to identify and remove a low priority task
-            // Since we don't have Task_GetInfo, we'll use a simpler approach
-
-            // Find a VM with tasks
-            for (VMId_t vm : vmsOnMachine)
-            {
-                VMInfo_t vmInfo = VM_GetInfo(vm);
-
-                if (!vmInfo.active_tasks.empty())
-                {
-                    // Remove the last task (assuming it might be lower priority)
-                    TaskId_t taskToRemove = vmInfo.active_tasks.back();
-
-                    LogMessage("MemoryWarning(): Removing task " +
-                                   to_string(taskToRemove) + " from VM " +
-                                   to_string(vm) + " to free memory",
-                               1);
-
-                    VM_RemoveTask(vm, taskToRemove);
-                    break;
-                }
+        } else {
+            // If we can't migrate, try to power on ANY machine to relieve pressure
+            bool poweredOnMachine = false;
+            
+            for (MachineId_t machine : scheduler.GetMachines()) {
+                // Skip active machines
+                if (scheduler.IsMachineActive(machine)) continue;
+                
+                // Power on the machine
+                LogMessage("MemoryWarning(): Powering on machine " + 
+                          to_string(machine) + " as a last resort", 1);
+                
+                Machine_SetState(machine, S0);
+                scheduler.ActivateMachine(machine);
+                poweredOnMachine = true;
+                break;
+            }
+            
+            if (!poweredOnMachine) {
+                LogMessage("MemoryWarning(): All machines are already active, cannot relieve memory pressure", 1);
             }
         }
+    } else {
+        LogMessage("MemoryWarning(): No suitable non-migrating VMs found on machine " + 
+                  to_string(machine_id), 1);
     }
-    else
-    {
-        LogMessage("MemoryWarning(): No VMs found on machine " +
-                       to_string(machine_id),
-                   1);
-    }
-
-    // 5. As a last resort, adjust machine power state to try to recover
-    LogMessage("MemoryWarning(): Setting machine " + to_string(machine_id) +
-                   " cores to maximum performance to help process tasks faster",
-               2);
-
+    
+    // 4. As a last resort, adjust machine power state to try to recover
+    LogMessage("MemoryWarning(): Setting machine " + to_string(machine_id) + 
+              " cores to maximum performance to help process tasks faster", 2);
+    
     // Set all cores to maximum performance
-    for (unsigned i = 0; i < machineInfo.num_cpus; i++)
-    {
+    for (unsigned i = 0; i < machineInfo.num_cpus; i++) {
         Machine_SetCorePerformance(machine_id, i, P0);
     }
 }
 
-void MigrationDone(Time_t time, VMId_t vm_id)
-{
-    // LogMessage("MigrationDone(): VM " + to_string(vm_id) +
-    //   " migration completed at time " + to_string(time), 2);
+void MigrationDone(Time_t time, VMId_t vm_id) {
+    LogMessage("MigrationDone(): VM " + to_string(vm_id) + 
+              " migration completed at time " + to_string(time), 2);
+    
+    // Make sure to update both tracking mechanisms
+    migrating = false;
     scheduler.MarkVMAsReady(vm_id);
     scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
-
-    // LogMessage("MigrationDone(): Migration completion processed", 2);
 }
 
 void SchedulerCheck(Time_t time)
@@ -374,6 +354,18 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id)
         bool hasVM = false;
         for (VMId_t vm : scheduler.GetVMs())
         {
+            // Skip VMs that are currently migrating
+
+            if (scheduler.IsVMMigrating(vm))
+            {
+
+                LogMessage("MemoryWarning(): Skipping VM " + to_string(vm) +
+
+                               " as it is currently migrating",
+                           3);
+
+                continue;
+            }
             VMInfo_t vmInfo = VM_GetInfo(vm);
             if (vmInfo.machine_id == machine_id)
             {
@@ -465,6 +457,7 @@ void SLAWarning(Time_t time, TaskId_t task_id)
 
     for (VMId_t vm : scheduler.GetVMs())
     {
+        if (scheduler.IsVMMigrating(vm)) continue;
         VMInfo_t vmInfo = VM_GetInfo(vm);
 
         for (TaskId_t task : vmInfo.active_tasks)
@@ -630,7 +623,7 @@ void SLAWarning(Time_t time, TaskId_t task_id)
 void Scheduler::Init()
 {
     LogMessage("Scheduler::Init(): Starting scheduler initialization", 2);
-
+    migratingVMs.clear();
     // Find the parameters of the clusters
     unsigned totalMachines = Machine_GetTotal();
     LogMessage("Scheduler::Init(): Total number of machines is " + to_string(totalMachines), 2);
@@ -746,6 +739,51 @@ void Scheduler::Init()
                    to_string(vms.size()) + " VMs and " +
                    to_string(activeMachines.size()) + " active machines",
                1);
+}
+
+bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
+    // Log attempt
+    std::cout << "DIRECT OUTPUT: Attempting to remove task " << task << " from VM " << vm << std::endl;
+    std::cout.flush();
+    
+    // Check if VM is migrating - use 'this' instead of 'scheduler'
+    if (this->IsVMMigrating(vm)) {
+        std::cout << "DIRECT OUTPUT: Cannot remove task - VM is migrating" << std::endl;
+        std::cout.flush();
+        return false;
+    }
+    
+    // Try to get VM info to check if it's active
+    try {
+        VMInfo_t info = VM_GetInfo(vm);
+        
+        // Check if task exists in VM
+        bool found = false;
+        for (TaskId_t t : info.active_tasks) {
+            if (t == task) {
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found) {
+            std::cout << "DIRECT OUTPUT: Cannot remove task - task not found in VM" << std::endl;
+            std::cout.flush();
+            return false;
+        }
+        
+        // If we got here, it should be safe to remove
+        std::cout << "DIRECT OUTPUT: Removing task " << task << " from VM " << vm << std::endl;
+        std::cout.flush();
+        
+        VM_RemoveTask(vm, task);
+        return true;
+    } 
+    catch (...) {
+        std::cout << "DIRECT OUTPUT: Exception when trying to get VM info" << std::endl;
+        std::cout.flush();
+        return false;
+    }
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id)
@@ -922,6 +960,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id)
     // Assign task to VM
     if (target_vm != VMId_t(-1))
     {
+        if (IsVMMigrating(target_vm)) {
+            LogMessage("Scheduler::NewTask(): Cannot assign task " + to_string(task_id) +
+                      " to VM " + to_string(target_vm) + " as it is migrating", 1);
+            return;
+        }
         LogMessage("Scheduler::NewTask(): Assigning task " + to_string(task_id) +
                        " to VM " + to_string(target_vm) + " with priority " +
                        to_string(priority),
@@ -1059,7 +1102,7 @@ void Scheduler::PeriodicCheck(Time_t now)
                     }
                 }
 
-                if (vmToMigrate != VMId_t(-1))
+                if (vmToMigrate != VMId_t(-1) && !IsVMMigrating(vmToMigrate))
                 {
                     // Find a target machine with compatible CPU
                     VMInfo_t vmInfo = VM_GetInfo(vmToMigrate);
@@ -1112,29 +1155,24 @@ void Scheduler::PeriodicCheck(Time_t now)
     LogMessage("Scheduler::PeriodicCheck(): Periodic check completed", 3);
 }
 
-void Scheduler::TaskComplete(Time_t now, TaskId_t task_id)
-{
-    LogMessage("Scheduler::TaskComplete(): Processing task completion for task " +
-                   to_string(task_id) + " at time " + to_string(now),
-               3);
-
+void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
+    LogMessage("Scheduler::TaskComplete(): Processing task completion for task " + 
+              to_string(task_id) + " at time " + to_string(now), 3);
+    
+    // Be careful not to access migrating VMs
     // Update machine utilization
-    LogMessage("Scheduler::TaskComplete(): Updating machine utilization", 4);
-
-    for (MachineId_t machine : machines)
-    {
+    for (MachineId_t machine : machines) {
         MachineInfo_t info = Machine_GetInfo(machine);
-
+        
         // Simple utilization calculation
         double utilization = 0.0;
-        if (info.num_cpus > 0)
-        {
+        if (info.num_cpus > 0) {
             utilization = static_cast<double>(info.active_tasks) / info.num_cpus;
         }
-
+        
         machineUtilization[machine] = utilization;
     }
-
+    
     LogMessage("Scheduler::TaskComplete(): Task completion processing finished", 3);
 }
 

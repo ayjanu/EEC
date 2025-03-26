@@ -21,6 +21,7 @@ public:
     bool IsMachineActive(MachineId_t machine) const { 
         return activeMachines.find(machine) != activeMachines.end(); 
     }
+    bool SafeRemoveTask(VMId_t vm, TaskId_t task);
     void ActivateMachine(MachineId_t machine) {
         activeMachines.insert(machine);
         machineUtilization[machine] = 0.0;
