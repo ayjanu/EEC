@@ -32,6 +32,17 @@ public:
     void AddVM(VMId_t vm) {
         vms.push_back(vm);
     }
+    void MarkVMAsMigrating(VMId_t vm) {
+        migratingVMs.insert(vm);
+    }
+    
+    void MarkVMAsReady(VMId_t vm) {
+        migratingVMs.erase(vm);
+    }
+    
+    bool IsVMMigrating(VMId_t vm) const {
+        return migratingVMs.find(vm) != migratingVMs.end();
+    }
     Scheduler() {}
     void Init();
     void MigrationComplete(Time_t time, VMId_t vm_id);
@@ -54,6 +65,8 @@ private:
     // Lists of VMs and machines
     std::vector<VMId_t> vms;
     std::vector<MachineId_t> machines;
+
+    std::set<VMId_t> migratingVMs;
 };
 
 #endif /* Scheduler_hpp */
