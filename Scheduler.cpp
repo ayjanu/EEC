@@ -43,11 +43,6 @@ void Scheduler::Init() {
             machineUtilization[machine] = 0.0;
         }
     }
-    
-    // Power down unused machines to save energy
-    for (MachineId_t machine : machines) {
-        if (activeMachines.find(machine) == activeMachines.end()) Machine_SetState(machine, S5);
-    }
 }
 
 bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
