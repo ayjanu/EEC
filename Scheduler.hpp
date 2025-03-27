@@ -10,40 +10,13 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <string>
 
 #include "Interfaces.h"
 #include "SimTypes.h"
 
 class Scheduler {
 public:
-    const std::vector<VMId_t>& GetVMs() const { return vms; }
-    const std::vector<MachineId_t>& GetMachines() const { return machines; }
-    bool IsMachineActive(MachineId_t machine) const { 
-        return activeMachines.find(machine) != activeMachines.end(); 
-    }
-    bool SafeRemoveTask(VMId_t vm, TaskId_t task);
-    void ActivateMachine(MachineId_t machine) {
-        activeMachines.insert(machine);
-        machineUtilization[machine] = 0.0;
-    }
-    void DeactivateMachine(MachineId_t machine) {
-        activeMachines.erase(machine);
-    }
-    
-    void AddVM(VMId_t vm) {
-        vms.push_back(vm);
-    }
-    void MarkVMAsMigrating(VMId_t vm) {
-        migratingVMs.insert(vm);
-    }
-    
-    void MarkVMAsReady(VMId_t vm) {
-        migratingVMs.erase(vm);
-    }
-    
-    bool IsVMMigrating(VMId_t vm) const {
-        return migratingVMs.find(vm) != migratingVMs.end();
-    }
     Scheduler() {}
     void Init();
     void MigrationComplete(Time_t time, VMId_t vm_id);
@@ -51,24 +24,51 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t now);
     void TaskComplete(Time_t now, TaskId_t task_id);
-    void MonitorSLA0Tasks(Time_t now);
-    void OptimizeForSLA0Tasks();
+    
+    // Helper functions
+    VMId_t FindBestVM(TaskId_t task_id, TaskClass_t taskClass, CPUType_t requiredCPU, 
+                     VMType_t requiredVM, bool needsGPU, unsigned memoryNeeded);
+    VMId_t CreateNewVM(VMType_t vmType, CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
+    void ConsolidateVMs(Time_t now);
+    void UpdateMachineUtilization();
+    double CalculateMachineUtilization(MachineId_t machineId);
+    void MigrateVMFromOverloadedMachine(MachineId_t machineId);
+    void AdjustMachinePowerState(MachineId_t machineId, double utilization);
+    MachineId_t FindSuitableMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
+    MachineId_t PowerOnMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
+    MachineId_t FindMigrationTarget(VMId_t vm, MachineId_t sourceMachine);
+    bool IsVMMigrating(VMId_t vm) const;
+    bool HasActiveJobs(MachineId_t machineId);
+    bool EnsureMachineAwake(MachineId_t machineId);
+    bool IsCompatibleVMCPU(VMType_t vmType, CPUType_t cpuType);
+    void CreateVMsForAllCPUTypes();
+    std::vector<VMId_t> GetCompatibleVMs(CPUType_t cpuType, VMType_t vmType);
+    bool PrepareVMForMigration(VMId_t vm);
+    bool IsVMPendingMigration(VMId_t vm) const;
+    
+    // Task information helper functions
+    TaskClass_t GetTaskClass(TaskId_t taskId);
+    bool IsGPUCapable(TaskId_t taskId);
+    unsigned GetMemory(TaskId_t taskId);
+    CPUType_t RequiredCPUType(TaskId_t taskId);
+    VMType_t RequiredVMType(TaskId_t taskId);
+    SLAType_t RequiredSLA(TaskId_t taskId);
     
 private:
-    // Thresholds for underload/overload detection
-    const double UNDERLOAD_THRESHOLD = 0.3;  // 30% utilization
-    const double OVERLOAD_THRESHOLD = 0.8;   // 80% utilization
+    // Configuration thresholds
+    const double HIGH_UTIL_THRESHOLD = 0.8;
+    const double LOW_UTIL_THRESHOLD = 0.3;
+    const Time_t CONSOLIDATION_INTERVAL = 300000;     // Check for consolidation every 5 minutes
+    Time_t lastConsolidationTime = 0;
     
-    // Track machine utilization
-    std::map<MachineId_t, double> machineUtilization;
-    
-    // Track which machines are powered on
-    std::set<MachineId_t> activeMachines;
-    
-    // Lists of VMs and machines
+    // Data structures
     std::vector<VMId_t> vms;
     std::vector<MachineId_t> machines;
-
+    std::map<TaskClass_t, std::vector<VMId_t>> taskClassToVMs;
+    std::map<MachineId_t, double> machineUtilization;
+    std::map<CPUType_t, std::vector<MachineId_t>> cpuTypeMachines;
+    std::map<VMId_t, MachineId_t> vmToMachine;
+    std::set<MachineId_t> activeMachines;
     std::set<VMId_t> migratingVMs;
 };
 
