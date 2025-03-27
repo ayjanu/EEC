@@ -8,7 +8,6 @@
 #include "Scheduler.hpp"
 #include "Internal_Interfaces.h"
 
-static bool migrating = false;
 static unsigned active_machines = 16;
 Scheduler scheduler;
 
@@ -26,11 +25,13 @@ void Scheduler::Init() {
     
     // Store machine IDs and gather machine information
     for(unsigned i = 0; i < total_machines; i++) {
-        machines.push_back(MachineId_t(i));
-        MachineInfo_t machine_info = Machine_GetInfo(i);
-        machine_has_gpu[i] = machine_info.gpus;
+        MachineId_t machineId = MachineId_t(i);
+        machines.push_back(machineId);
+        MachineInfo_t info = Machine_GetInfo(machineId);
+        CPUType_t cpuType = info.cpu;
+        machine_has_gpu[i] = info.gpus;
         machine_states[i] = S0; // Start all machines in active state
-        machine_cpus[i] = machine_info.cpu;
+        machine_cpus[i] = info.cpu;
     }
     
     // Create VMs with compatible CPU types for each active machine
@@ -46,12 +47,17 @@ void Scheduler::Init() {
         // Create VM with the same CPU type as the machine
         VMId_t vm = VM_Create(vm_type, machine_cpus[i]);
         vms.push_back(vm);
-        VMInfo_t vinfo = VM_GetInfo(vm);
-        // Attach VM to the machine
         VM_Attach(vm, machine_id);
         
         // Initialize load tracking
         vm_load[vm] = 0;
+
+        VMId_t vm2 = VM_Create(vm_type, machine_cpus[i]);
+        vms.push_back(vm2);
+        VM_Attach(vm2, machine_id);
+        
+        // Initialize load tracking
+        vm_load[vm2] = 0;
         
         SimOutput("Scheduler::Init(): Created VM " + to_string(vm) + 
                   " with CPU type " + to_string(machine_cpus[i]) + 
@@ -112,17 +118,16 @@ VMId_t Scheduler::findBestVMForTask(TaskId_t task_id) {
     TaskInfo_t task_info = GetTaskInfo(task_id);
     bool needs_gpu = task_info.gpu_capable;
     unsigned task_memory = task_info.required_memory;
+    CPUType_t ctype = task_info.required_cpu;
     
     for (size_t i = 0; i < vms.size(); i++) {
         VMId_t vm = vms[i];
-        
         // Skip if VM is migrating
-        if (VM_IsPendingMigration(vm)) {
-            continue;
-        }
+        if (VM_IsPendingMigration(vm)) continue;
         
         // Get VM info to find its machine
         VMInfo_t vm_info = VM_GetInfo(vm);
+        if (vm_info.cpu != ctype) continue; 
         MachineId_t machine = vm_info.machine_id;
         
         // Base score is current load
@@ -267,10 +272,6 @@ void Scheduler::adjustMachineStates() {
 }
 
 void Scheduler::migrateVMIfNeeded(Time_t now) {
-    // Don't migrate if already migrating
-    if (migrating) {
-        return;
-    }
     
     // Find overloaded and underloaded machines
     vector<MachineId_t> overloaded;
@@ -291,16 +292,25 @@ void Scheduler::migrateVMIfNeeded(Time_t now) {
     
     // Determine average load
     unsigned total_load = 0;
+    unsigned active_machine_count = 0;
     for (auto& load_pair : machine_load) {
         total_load += load_pair.second;
+        if (machine_states[load_pair.first] == S0) {
+            active_machine_count++;
+        }
     }
     
-    double avg_load = (machine_load.size() > 0) ? total_load / (double)machine_load.size() : 0;
+    double avg_load = (active_machine_count > 0) ? total_load / (double)active_machine_count : 0;
     
     // Classify machines
     for (auto& load_pair : machine_load) {
         MachineId_t machine = load_pair.first;
         unsigned load = load_pair.second;
+        
+        // Only consider active machines
+        if (machine_states[machine] != S0) {
+            continue;
+        }
         
         if (load > avg_load * 1.5) {
             overloaded.push_back(machine);
@@ -329,27 +339,80 @@ void Scheduler::migrateVMIfNeeded(Time_t now) {
         
         // Try to migrate a VM
         for (VMId_t vm : candidate_vms) {
-            MachineId_t dest = underloaded.back();
+            // Get VM's CPU type
+            VMInfo_t vm_info = VM_GetInfo(vm);
+            CPUType_t vm_cpu_type = vm_info.cpu;
             
-            // Check if destination has enough resources
+            // Calculate VM memory requirements
             unsigned vm_memory = 0;
             for (TaskId_t task : vm_tasks[vm]) {
                 TaskInfo_t task_info = GetTaskInfo(task);
                 vm_memory += task_info.required_memory;
             }
             
-            MachineInfo_t dest_info = Machine_GetInfo(dest);
-            unsigned available_memory = dest_info.memory_size - dest_info.memory_used;
-            
-            if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD) {
-                // Initiate migration
-                migrating = true;
-                VM_Migrate(vm, dest);
-                SimOutput("Scheduler::migrateVMIfNeeded(): Migrating VM " + to_string(vm) + 
-                          " from machine " + to_string(src) + " to " + to_string(dest), 2);
+            // Find compatible underloaded machines
+            for (auto it = underloaded.begin(); it != underloaded.end(); ) {
+                MachineId_t dest = *it;
                 
-                // Remove destination from underloaded list
-                underloaded.pop_back();
+                // Check CPU compatibility
+                CPUType_t dest_cpu_type = Machine_GetCPUType(dest);
+                if (vm_cpu_type != dest_cpu_type) {
+                    // CPU types are incompatible, try next machine
+                    ++it;
+                    continue;
+                }
+                
+                // Check if destination has enough resources
+                MachineInfo_t dest_info = Machine_GetInfo(dest);
+                unsigned available_memory = dest_info.memory_size - dest_info.memory_used;
+                
+                // Check if GPU requirements match
+                bool vm_needs_gpu = false;
+                for (TaskId_t task : vm_tasks[vm]) {
+                    TaskInfo_t task_info = GetTaskInfo(task);
+                    if (task_info.gpu_capable) {
+                        vm_needs_gpu = true;
+                        break;
+                    }
+                }
+                
+                // Skip if VM needs GPU but destination doesn't have one
+                if (vm_needs_gpu && !dest_info.gpus) {
+                    ++it;
+                    continue;
+                }
+                
+                if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD && !VM_IsPendingMigration(vm)) {
+                    // Initiate migration
+                    VM_MigrationStarted(vm);
+                    VM_Migrate(vm, dest);
+                    SimOutput("Scheduler::migrateVMIfNeeded(): Migrating VM " + to_string(vm) + 
+                              " from machine " + to_string(src) + 
+                              " to " + to_string(dest) + 
+                              " (CPU type: " + to_string(dest_cpu_type) + ")", 2);
+                    
+                    // Remove destination from underloaded list
+                    underloaded.erase(it);
+                    
+                    // Successfully migrated a VM, break out of the loop
+                    return;
+                }
+                
+                // This machine wasn't suitable, try the next one
+                ++it;
+            }
+        }
+    }
+    
+    // If we have idle machines in S3 state and overloaded machines, consider waking up a machine
+    if (!overloaded.empty()) {
+        for (MachineId_t machine : machines) {
+            if (machine_states[machine] == S3) {
+                // Wake up this machine
+                Machine_SetState(machine, S0);
+                machine_states[machine] = S0;
+                SimOutput("Scheduler::migrateVMIfNeeded(): Waking up machine " + to_string(machine) + 
+                          " to handle load imbalance", 2);
                 break;
             }
         }
@@ -360,8 +423,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) + 
               " migration completed at time " + to_string(time), 2);
     
-    // Update tracking
-    migrating = false;
+    VM_MigrationCompleted(vm_id);
 }
 
 void Scheduler::MemoryWarningHandler(Time_t time, MachineId_t machine_id) {
@@ -394,6 +456,7 @@ void Scheduler::MemoryWarningHandler(Time_t time, MachineId_t machine_id) {
     
     // Find a target machine with available memory
     for (VMId_t vm : machine_vms) {
+        if (VM_IsPendingMigration(vm)) continue;
         // Calculate VM memory usage
         unsigned vm_memory = 0;
         for (TaskId_t task : vm_tasks[vm]) {
@@ -403,13 +466,14 @@ void Scheduler::MemoryWarningHandler(Time_t time, MachineId_t machine_id) {
         
         // Find a suitable destination
         for (MachineId_t dest : machines) {
-            if (dest == machine_id) continue;
+            // if (dest == machine_id) continue;
             
             MachineInfo_t dest_info = Machine_GetInfo(dest);
             unsigned available_memory = dest_info.memory_size - dest_info.memory_used;
             
             if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD) {
                 // Migrate VM to destination
+                // VM_MigrationStarted(vm);
                 VM_Migrate(vm, dest);
                 SimOutput("Scheduler::MemoryWarningHandler(): Migrating VM " + to_string(vm) + 
                           " from machine " + to_string(machine_id) + " to " + to_string(dest), 2);
