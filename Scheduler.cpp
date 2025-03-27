@@ -10,12 +10,12 @@
 #include <sstream>
 #include <iostream>
 #include <climits>
+#include "Internal_Interfaces.h"
 
 // Global Scheduler instance
 static Scheduler scheduler;
 
 void Scheduler::Init() {
-    migratingVMs.clear();
     unsigned totalMachines = Machine_GetTotal();
     std::map<CPUType_t, std::vector<MachineId_t>> machinesByCPU;
     for (unsigned i = 0; i < totalMachines; i++) {
@@ -51,28 +51,11 @@ void Scheduler::Init() {
 }
 
 bool Scheduler::SafeRemoveTask(VMId_t vm, TaskId_t task) {
-    if (IsVMMigrating(vm)) return false;
-    try {
-        VMInfo_t info = VM_GetInfo(vm);
-        if (info.machine_id == MachineId_t(-1)) return false;
-        bool taskFound = false;
-        for (TaskId_t t : info.active_tasks) {
-            if (t == task) {
-                taskFound = true;
-                break;
-            }
-        }
-        if (!taskFound) return false;
-        if (!IsVMMigrating(vm)) {
-            VM_RemoveTask(vm, task);
-            return true;
-        }
-        return false;
-    } 
-    catch (...) {
-        SimOutput("SafeRemoveTask CAUGHT",4);
-        return false;
+    if (!VM_IsPendingMigration(vm)) {
+        VM_RemoveTask(vm, task);
+        return true;
     }
+    return false;
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -105,7 +88,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // For SLA0 and SLA1, find VM with fewest tasks
     if (sla_type == SLA0 || sla_type == SLA1) {
         for (VMId_t vm : vms) {
-            if (IsVMMigrating(vm)) continue;
+            if (VM_IsPendingMigration(vm)) continue;
             
             try {
                 VMInfo_t info = VM_GetInfo(vm);
@@ -129,7 +112,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // For other SLA types, find any suitable VM
     else {
         for (VMId_t vm : vms) {
-            if (IsVMMigrating(vm)) continue;
+            if (VM_IsPendingMigration(vm)) continue;
             
             try {
                 VMInfo_t info = VM_GetInfo(vm);
@@ -215,7 +198,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     
     // Assign task to VM
     if (target_vm != VMId_t(-1)) {
-        if (IsVMMigrating(target_vm)) return;
+        if (VM_IsPendingMigration(target_vm)) return;
         
         try {
             VMInfo_t info = VM_GetInfo(target_vm);
@@ -262,7 +245,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
             bool hasHighPriorityTasks = false;
             
             for (VMId_t vm : vms) {
-                if (IsVMMigrating(vm)) continue;
+                if (VM_IsPendingMigration(vm)) continue;
                 
                 try {
                     VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -316,7 +299,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     }
     
     // Skip VM consolidation if there are any migrations in progress
-    if (now > 1000000 && migratingVMs.empty()) {
+    if (now > 1000000) {
         // Identify underutilized machines
         std::vector<MachineId_t> underutilizedMachines;
         for (MachineId_t machine : activeMachines) {
@@ -340,7 +323,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 // Check if this machine has any high-priority tasks
                 bool hasHighPriorityTasks = false;
                 for (VMId_t vm : vms) {
-                    if (IsVMMigrating(vm)) continue;
+                    if (VM_IsPendingMigration(vm)) continue;
                     
                     try {
                         VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -367,7 +350,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                     VMId_t vmToMigrate = VMId_t(-1);
                     
                     for (VMId_t vm : vms) {
-                        if (IsVMMigrating(vm)) continue;
+                        if (VM_IsPendingMigration(vm)) continue;
                         
                         try {
                             VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -424,12 +407,12 @@ void Scheduler::PeriodicCheck(Time_t now) {
                             
                             // Perform the migration
                             if (targetMachine != MachineId_t(-1)) {
-                                MarkVMAsMigrating(vmToMigrate);
+                                VM_MigrationStarted(vmToMigrate);
                                 VM_Migrate(vmToMigrate, targetMachine);
                             }
                         } catch (...) {
                             SimOutput("Periodic 8 CAUGHT",4);
-                            MarkVMAsReady(vmToMigrate);
+                            VM_MigrationStarted(vmToMigrate);
                         }
                     }
                 }
@@ -466,7 +449,7 @@ void Scheduler::Shutdown(Time_t time) {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    MarkVMAsReady(vm_id);
+    VM_MigrationCompleted(vm_id);
 }
 
 void InitScheduler() {
@@ -492,7 +475,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
         std::map<VMId_t, unsigned> vmTaskCount;
         
         for (VMId_t vm : scheduler.GetVMs()) {
-            if (scheduler.IsVMMigrating(vm)) continue;
+            if (VM_IsPendingMigration(vm)) continue;
             
             try {
                 VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -518,7 +501,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
         }
         
         // Migrate the VM if possible
-        if (largestVM != VMId_t(-1) && !scheduler.IsVMMigrating(largestVM)) {
+        if (largestVM != VMId_t(-1) && !VM_IsPendingMigration(largestVM)) {
             try {
                 VMInfo_t vmInfo = VM_GetInfo(largestVM);
                 CPUType_t vmCpuType = vmInfo.cpu;
@@ -584,7 +567,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 
                 // Perform the migration
                 if (targetMachine != MachineId_t(-1)) {
-                    scheduler.MarkVMAsMigrating(largestVM);
+                    VM_MigrationStarted(largestVM);
                     VM_Migrate(largestVM, targetMachine);
                 } else {
                     // If migration not possible, power on another machine as a last resort
@@ -604,7 +587,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
                 }
             } catch (...) {
                 SimOutput("MemoryWarning 5 CAUGHT",4);
-                scheduler.MarkVMAsReady(largestVM);
+                VM_MigrationCompleted(largestVM);
             }
         }
         
@@ -653,7 +636,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             // Check if this machine already has a VM
             bool hasVM = false;
             for (VMId_t vm : scheduler.GetVMs()) {
-                if (scheduler.IsVMMigrating(vm)) continue;
+                if (VM_IsPendingMigration(vm)) continue;
                 
                 try {
                     VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -697,7 +680,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
     MachineId_t taskMachine = MachineId_t(-1);
     
     for (VMId_t vm : scheduler.GetVMs()) {
-        if (scheduler.IsVMMigrating(vm)) continue;
+        if (VM_IsPendingMigration(vm)) continue;
         
         try {
             VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -731,7 +714,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                     Machine_SetCorePerformance(taskMachine, i, P0);
                 }
                 
-                if (!scheduler.IsVMMigrating(taskVM)) {
+                if (!VM_IsPendingMigration(taskVM)) {
 
                     // Move other tasks away from this VM if possible
 
@@ -770,7 +753,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
                         VMId_t targetVM = VMId_t(-1);
                         
                         for (VMId_t vm : scheduler.GetVMs()) {
-                            if (vm == taskVM || scheduler.IsVMMigrating(vm)) continue;
+                            if (vm == taskVM || VM_IsPendingMigration(vm)) continue;
                             
                             try {
                                 VMInfo_t otherVMInfo = VM_GetInfo(vm);
