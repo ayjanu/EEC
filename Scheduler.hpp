@@ -37,24 +37,15 @@ public:
     MachineId_t FindSuitableMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
     MachineId_t PowerOnMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
     MachineId_t FindMigrationTarget(VMId_t vm, MachineId_t sourceMachine);
-    bool IsVMMigrating(VMId_t vm) const;
     bool HasActiveJobs(MachineId_t machineId);
     bool EnsureMachineAwake(MachineId_t machineId);
     bool IsCompatibleVMCPU(VMType_t vmType, CPUType_t cpuType);
     void CreateVMsForAllCPUTypes();
     std::vector<VMId_t> GetCompatibleVMs(CPUType_t cpuType, VMType_t vmType);
-    bool PrepareVMForMigration(VMId_t vm);
+    TaskClass_t GetTaskClass(TaskId_t taskId);
     void HandleSLAWarning(Time_t time, TaskId_t task_id);
     void HandleStateChangeComplete(Time_t time, MachineId_t machine_id);
     bool RequestMachineStateChange(MachineId_t machineId, MachineState_t newState);
-    
-    // Task information helper functions
-    TaskClass_t GetTaskClass(TaskId_t taskId);
-    bool IsGPUCapable(TaskId_t taskId);
-    unsigned GetMemory(TaskId_t taskId);
-    CPUType_t RequiredCPUType(TaskId_t taskId);
-    VMType_t RequiredVMType(TaskId_t taskId);
-    SLAType_t RequiredSLA(TaskId_t taskId);
     
 private:
     // Configuration thresholds
@@ -71,7 +62,6 @@ private:
     std::map<CPUType_t, std::vector<MachineId_t>> cpuTypeMachines;
     std::map<VMId_t, MachineId_t> vmToMachine;
     std::set<MachineId_t> activeMachines;
-    std::set<VMId_t> migratingVMs;
     std::map<TaskId_t, bool> slaViolatedTasks;  // Track tasks with SLA violations
     std::map<MachineId_t, bool> pendingStateChanges;  // Track machines with pending state changes
     std::set<TaskId_t> highPriorityTasks;
