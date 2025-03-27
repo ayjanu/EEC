@@ -1,19 +1,12 @@
-//
-//  Scheduler.hpp
-//  CloudSim
-//
-
 #ifndef Scheduler_hpp
 #define Scheduler_hpp
 
 #include <vector>
 #include <map>
-#include <set>
+#include <queue>
 #include <algorithm>
-#include <string>
 
 #include "Interfaces.h"
-#include "SimTypes.h"
 
 class Scheduler {
 public:
@@ -24,47 +17,35 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t now);
     void TaskComplete(Time_t now, TaskId_t task_id);
-    
-    // Helper functions
-    VMId_t FindBestVM(TaskId_t task_id, TaskClass_t taskClass, CPUType_t requiredCPU, 
-                     VMType_t requiredVM, bool needsGPU, unsigned memoryNeeded);
-    VMId_t CreateNewVM(VMType_t vmType, CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
-    void ConsolidateVMs(Time_t now);
-    void UpdateMachineUtilization();
-    double CalculateMachineUtilization(MachineId_t machineId);
-    void MigrateVMFromOverloadedMachine(MachineId_t machineId);
-    void AdjustMachinePowerState(MachineId_t machineId, double utilization);
-    MachineId_t FindSuitableMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
-    MachineId_t PowerOnMachine(CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded);
-    MachineId_t FindMigrationTarget(VMId_t vm, MachineId_t sourceMachine);
-    bool HasActiveJobs(MachineId_t machineId);
-    bool EnsureMachineAwake(MachineId_t machineId);
-    bool IsCompatibleVMCPU(VMType_t vmType, CPUType_t cpuType);
-    void CreateVMsForAllCPUTypes();
-    std::vector<VMId_t> GetCompatibleVMs(CPUType_t cpuType, VMType_t vmType);
-    TaskClass_t GetTaskClass(TaskId_t taskId);
-    void HandleSLAWarning(Time_t time, TaskId_t task_id);
-    void HandleStateChangeComplete(Time_t time, MachineId_t machine_id);
-    bool RequestMachineStateChange(MachineId_t machineId, MachineState_t newState);
-    
+    void MemoryWarningHandler(Time_t time, MachineId_t machine_id);
+
+    // Made public so SLAWarning can access it
+    map<TaskId_t, VMId_t> task_to_vm;
+
 private:
-    // Configuration thresholds
-    const double HIGH_UTIL_THRESHOLD = 0.8;
-    const double LOW_UTIL_THRESHOLD = 0.3;
-    const Time_t CONSOLIDATION_INTERVAL = 300000;     // Check for consolidation every 5 minutes
-    Time_t lastConsolidationTime = 0;
+    vector<VMId_t> vms;
+    vector<MachineId_t> machines;
     
-    // Data structures
-    std::vector<VMId_t> vms;
-    std::vector<MachineId_t> machines;
-    std::map<TaskClass_t, std::vector<VMId_t>> taskClassToVMs;
-    std::map<MachineId_t, double> machineUtilization;
-    std::map<CPUType_t, std::vector<MachineId_t>> cpuTypeMachines;
-    std::map<VMId_t, MachineId_t> vmToMachine;
-    std::set<MachineId_t> activeMachines;
-    std::map<TaskId_t, bool> slaViolatedTasks;  // Track tasks with SLA violations
-    std::map<MachineId_t, bool> pendingStateChanges;  // Track machines with pending state changes
-    std::set<TaskId_t> highPriorityTasks;
+    // Track VM load and task assignments
+    map<VMId_t, unsigned> vm_load;
+    map<VMId_t, vector<TaskId_t>> vm_tasks;
+    
+    // Track machine states and capabilities
+    map<MachineId_t, bool> machine_has_gpu;
+    map<MachineId_t, MachineState_t> machine_states;
+    map<MachineId_t, CPUType_t> machine_cpus;
+    // SLA tracking
+    map<TaskId_t, SLAType_t> task_sla;
+    map<TaskId_t, Time_t> task_arrival;
+    
+    // Energy tracking
+    Time_t last_energy_check;
+    double last_cluster_energy;
+    
+    // Helper methods
+    VMId_t findBestVMForTask(TaskId_t task_id);
+    void adjustMachineStates();
+    void migrateVMIfNeeded(Time_t now);
 };
 
 #endif /* Scheduler_hpp */
