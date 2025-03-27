@@ -12,6 +12,7 @@
 #include <algorithm>
 
 #include "Interfaces.h"
+#include "Internal_Interfaces.h"
 #include "SimTypes.h"
 
 class Scheduler {
@@ -53,7 +54,8 @@ public:
     void TaskComplete(Time_t now, TaskId_t task_id);
     void MonitorSLA0Tasks(Time_t now);
     void OptimizeForSLA0Tasks();
-    
+    std::set<MachineId_t> activeMachines;
+
 private:
     // Thresholds for underload/overload detection
     const double UNDERLOAD_THRESHOLD = 0.3;  // 30% utilization
@@ -63,7 +65,6 @@ private:
     std::map<MachineId_t, double> machineUtilization;
     
     // Track which machines are powered on
-    std::set<MachineId_t> activeMachines;
     
     // Lists of VMs and machines
     std::vector<VMId_t> vms;
