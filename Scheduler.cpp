@@ -420,6 +420,11 @@ void Scheduler::AdjustMachinePowerState(MachineId_t machineId, double utilizatio
     try {
         MachineInfo_t info = Machine_GetInfo(machineId);
         
+        // Check if machine has pending state change
+        if (pendingStateChanges[machineId]) {
+            return;
+        }
+        
         bool hasVMs = false;
         for (VMId_t vm : vms) {
             VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -430,24 +435,47 @@ void Scheduler::AdjustMachinePowerState(MachineId_t machineId, double utilizatio
         }
         
         if (!hasVMs) {
-            Machine_SetState(machineId, S5);
-            activeMachines.erase(machineId);
+            RequestMachineStateChange(machineId, S5);
         } else {
-            if (utilization < LOW_UTIL_THRESHOLD) {
-                for (unsigned i = 0; i < info.num_cpus; i++) {
-                    Machine_SetCorePerformance(machineId, i, P3);
+            // Check if machine has any high-priority tasks
+            bool hasHighPriorityTasks = false;
+            for (VMId_t vm : vms) {
+                VMInfo_t vmInfo = VM_GetInfo(vm);
+                if (vmInfo.machine_id == machineId) {
+                    for (TaskId_t task : vmInfo.active_tasks) {
+                        SLAType_t sla = RequiredSLA(task);
+                        if (sla == SLA0 || sla == SLA1) {
+                            hasHighPriorityTasks = true;
+                            break;
+                        }
+                    }
                 }
-            } else if (utilization < 0.5) {
-                for (unsigned i = 0; i < info.num_cpus; i++) {
-                    Machine_SetCorePerformance(machineId, i, P2);
-                }
-            } else if (utilization < 0.8) {
-                for (unsigned i = 0; i < info.num_cpus; i++) {
-                    Machine_SetCorePerformance(machineId, i, P1);
-                }
-            } else {
+                if (hasHighPriorityTasks) break;
+            }
+            
+            // For machines with high-priority tasks, keep at higher performance
+            if (hasHighPriorityTasks) {
                 for (unsigned i = 0; i < info.num_cpus; i++) {
                     Machine_SetCorePerformance(machineId, i, P0);
+                }
+            } else {
+                // Adjust based on utilization
+                if (utilization < LOW_UTIL_THRESHOLD) {
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machineId, i, P3);
+                    }
+                } else if (utilization < 0.5) {
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machineId, i, P2);
+                    }
+                } else if (utilization < 0.8) {
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machineId, i, P1);
+                    }
+                } else {
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(machineId, i, P0);
+                    }
                 }
             }
         }
@@ -518,6 +546,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         taskInfo.required_memory = GetMemory(task_id);
     }
     
+    // Track high-priority tasks
+    if (taskInfo.required_sla == SLA0 || taskInfo.required_sla == SLA1) {
+        highPriorityTasks.insert(task_id);
+    }
+    
     if (!IsCompatibleVMCPU(taskInfo.required_vm, taskInfo.required_cpu)) {
         SimOutput("WARNING: Task " + std::to_string(task_id) + 
                  " requires incompatible VM-CPU combination. Adjusting VM type.", 1);
@@ -536,11 +569,89 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     Priority_t priority;
     switch (taskInfo.required_sla) {
         case SLA0: priority = HIGH_PRIORITY; break;
-        case SLA1: priority = HIGH_PRIORITY; break;
+        case SLA1: priority = HIGH_PRIORITY;  break;
         case SLA2: priority = MID_PRIORITY; break;
         default: priority = LOW_PRIORITY;
     }
     
+    // For high-priority tasks, try to find machines with low utilization
+    if (taskInfo.required_sla == SLA0 || taskInfo.required_sla == SLA1) {
+        MachineId_t bestMachine = MachineId_t(-1);
+        double lowestUtil = 1.0;
+        
+        for (MachineId_t machineId : machines) {
+            if (activeMachines.find(machineId) == activeMachines.end()) continue;
+            
+            MachineInfo_t info = Machine_GetInfo(machineId);
+            
+            // Check if machine meets requirements
+            if (info.cpu != taskInfo.required_cpu) continue;
+            if (taskInfo.gpu_capable && !info.gpus) continue;
+            if (info.memory_used + taskInfo.required_memory > info.memory_size) continue;
+            
+            // Check utilization
+            double util = machineUtilization[machineId];
+            if (util < lowestUtil) {
+                lowestUtil = util;
+                bestMachine = machineId;
+            }
+        }
+        
+        // If we found a good machine, try to use it
+        if (bestMachine != MachineId_t(-1)) {
+            // Find or create a VM on this machine
+            VMId_t targetVM = VMId_t(-1);
+            
+            for (VMId_t vm : vms) {
+                if (IsVMMigrating(vm)) continue;
+                
+                VMInfo_t vmInfo = VM_GetInfo(vm);
+                if (vmInfo.machine_id != bestMachine) continue;
+                if (vmInfo.vm_type != taskInfo.required_vm) continue;
+                if (vmInfo.cpu != taskInfo.required_cpu) continue;
+                
+                targetVM = vm;
+                break;
+            }
+            
+            if (targetVM == VMId_t(-1)) {
+                // Create new VM on this machine
+                try {
+                    targetVM = VM_Create(taskInfo.required_vm, taskInfo.required_cpu);
+                    vms.push_back(targetVM);
+                    VM_Attach(targetVM, bestMachine);
+                    vmToMachine[targetVM] = bestMachine;
+                    
+                    TaskClass_t taskClass = GetTaskClass(task_id);
+                    taskClassToVMs[taskClass].push_back(targetVM);
+                } catch (...) {
+                    targetVM = VMId_t(-1);
+                }
+            }
+            
+            if (targetVM != VMId_t(-1)) {
+                // Add task to VM
+                try {
+                    VM_AddTask(targetVM, task_id, priority);
+                    
+                    // Set machine to maximum performance
+                    MachineInfo_t info = Machine_GetInfo(bestMachine);
+                    for (unsigned i = 0; i < info.num_cpus; i++) {
+                        Machine_SetCorePerformance(bestMachine, i, P0);
+                    }
+                    
+                    SimOutput("Added high-priority task " + std::to_string(task_id) + 
+                             " to VM " + std::to_string(targetVM) + 
+                             " on low-utilization machine " + std::to_string(bestMachine), 2);
+                    return;
+                } catch (...) {
+                    // Failed to add task, continue with normal flow
+                }
+            }
+        }
+    }
+    
+    // Normal flow - find compatible VMs
     std::vector<VMId_t> compatibleVMs = GetCompatibleVMs(taskInfo.required_cpu, taskInfo.required_vm);
     
     VMId_t targetVM = VMId_t(-1);
@@ -565,8 +676,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             targetMachine = machineId;
             
             if (activeMachines.find(machineId) == activeMachines.end()) {
-                Machine_SetState(machineId, S0);
-                activeMachines.insert(machineId);
+                RequestMachineStateChange(machineId, S0);
             }
             
             break;
@@ -608,10 +718,24 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                      " to VM " + std::to_string(targetVM), 2);
         } catch (const std::exception& e) {
             SimOutput("ERROR: Failed to add task to VM: " + std::string(e.what()), 1);
+            
+            // For high-priority tasks, add to waiting list
+            if (taskInfo.required_sla == SLA0 || taskInfo.required_sla == SLA1) {
+                highPriorityTasks.insert(task_id);
+                SimOutput("Added high-priority task " + std::to_string(task_id) + 
+                         " to waiting list", 2);
+            }
         }
     } else {
         SimOutput("ERROR: Could not find or create suitable VM for task " + 
                  std::to_string(task_id), 1);
+        
+        // For high-priority tasks, add to waiting list
+        if (taskInfo.required_sla == SLA0 || taskInfo.required_sla == SLA1) {
+            highPriorityTasks.insert(task_id);
+            SimOutput("Added high-priority task " + std::to_string(task_id) + 
+                     " to waiting list", 2);
+        }
     }
 }
 
@@ -636,6 +760,11 @@ void Scheduler::PeriodicCheck(Time_t now) {
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
+    // Remove task from tracking
+    slaViolatedTasks.erase(task_id);
+    highPriorityTasks.erase(task_id);
+    highPriorityTasks.erase(task_id);
+    
     for (VMId_t vm : vms) {
         if (!IsVMMigrating(vm)) {
             VMInfo_t vmInfo = VM_GetInfo(vm);
@@ -723,6 +852,216 @@ VMId_t Scheduler::FindBestVM(TaskId_t task_id, TaskClass_t taskClass, CPUType_t 
     }
     
     return VMId_t(-1);
+}
+
+void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {
+    SimOutput("SLAWarning(): Task " + std::to_string(task_id) + " is at risk of SLA violation at time " + std::to_string(time), 2);
+    
+    // Mark this task as having an SLA violation
+    slaViolatedTasks[task_id] = true;
+    
+    // Find which VM is running this task
+    VMId_t targetVM = VMId_t(-1);
+    MachineId_t machineId = MachineId_t(-1);
+    
+    for (VMId_t vm : vms) {
+        VMInfo_t vmInfo = VM_GetInfo(vm);
+        for (TaskId_t t : vmInfo.active_tasks) {
+            if (t == task_id) {
+                targetVM = vm;
+                machineId = vmInfo.machine_id;
+                break;
+            }
+        }
+        if (targetVM != VMId_t(-1)) break;
+    }
+    
+    if (targetVM == VMId_t(-1) || machineId == MachineId_t(-1)) {
+        SimOutput("SLAWarning(): Could not find VM/machine for task " + std::to_string(task_id), 1);
+        return;
+    }
+    
+    // Get SLA type
+    SLAType_t slaType = RequiredSLA(task_id);
+    
+    // Take action based on SLA type
+    if (slaType == SLA0 || slaType == SLA1) {
+        // For high-priority SLAs, take immediate action
+        
+        // 1. Boost task priority if not already at highest
+        if (GetTaskPriority(task_id) != HIGH_PRIORITY) {
+            SetTaskPriority(task_id, HIGH_PRIORITY);
+        }
+        
+        // 2. Set machine to maximum performance
+        MachineInfo_t info = Machine_GetInfo(machineId);
+        for (unsigned i = 0; i < info.num_cpus; i++) {
+            Machine_SetCorePerformance(machineId, i, P0);
+        }
+        
+        // 3. Check if we should migrate to a less loaded machine
+        double utilization = CalculateMachineUtilization(machineId);
+        if (utilization > 0.7) { // If machine is quite busy
+            // Try to find a better machine
+            MachineId_t betterMachine = MachineId_t(-1);
+            double lowestUtil = 1.0;
+            
+            for (MachineId_t m : machines) {
+                if (m == machineId) continue;
+                if (activeMachines.find(m) == activeMachines.end()) continue;
+                
+                try {
+                    MachineInfo_t mInfo = Machine_GetInfo(m);
+                    
+                    // Check if machine is compatible
+                    if (mInfo.cpu != info.cpu) continue;
+                    
+                    // Check if machine has GPU if needed
+                    if (IsGPUCapable(task_id) && !mInfo.gpus) continue;
+                    
+                    // Check utilization
+                    double mUtil = machineUtilization[m];
+                    if (mUtil < lowestUtil && mUtil < 0.5) {
+                        lowestUtil = mUtil;
+                        betterMachine = m;
+                    }
+                } catch (...) {
+                    continue;
+                }
+            }
+            
+            // If we found a better machine, migrate the VM
+            if (betterMachine != MachineId_t(-1)) {
+                if (EnsureMachineAwake(betterMachine)) {
+                    try {
+                        if (PrepareVMForMigration(targetVM)) {
+                            Machine_MigrateVM(targetVM, machineId, betterMachine);
+                            vmToMachine[targetVM] = betterMachine;
+                            SimOutput("SLAWarning(): Migrating VM " + std::to_string(targetVM) + 
+                                    " to less loaded machine " + std::to_string(betterMachine), 2);
+                        }
+                    } catch (const std::exception& e) {
+                        SimOutput("ERROR: Migration failed in SLAWarning: " + std::string(e.what()), 1);
+                        migratingVMs.erase(targetVM);
+                    }
+                }
+            }
+        }
+    } else if (slaType == SLA2) {
+        // For medium-priority SLAs, take moderate action
+        
+        // 1. Boost task priority if currently low
+        if (GetTaskPriority(task_id) == LOW_PRIORITY) {
+            SetTaskPriority(task_id, MID_PRIORITY);
+        }
+        
+        // 2. Set machine to good performance
+        MachineInfo_t info = Machine_GetInfo(machineId);
+        for (unsigned i = 0; i < info.num_cpus; i++) {
+            Machine_SetCorePerformance(machineId, i, P1);
+        }
+    }
+    // For SLA3, we don't take any action (best effort)
+}
+
+void Scheduler::HandleStateChangeComplete(Time_t time, MachineId_t machine_id) {
+    SimOutput("StateChangeComplete(): Machine " + std::to_string(machine_id) + 
+             " completed state change at time " + std::to_string(time), 3);
+    
+    // Mark that the state change is complete
+    pendingStateChanges[machine_id] = false;
+    
+    // Update our tracking of active machines
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.s_state == S0) {
+        activeMachines.insert(machine_id);
+        
+        // Update utilization
+        machineUtilization[machine_id] = CalculateMachineUtilization(machine_id);
+        
+        // Check if we have high-priority tasks waiting for resources
+        if (!highPriorityTasks.empty()) {
+            for (auto it = highPriorityTasks.begin(); it != highPriorityTasks.end(); ) {
+                TaskId_t task_id = *it;
+                
+                // Try to find a VM for this task
+                CPUType_t requiredCPU = RequiredCPUType(task_id);
+                VMType_t requiredVM = RequiredVMType(task_id);
+                bool needsGPU = IsGPUCapable(task_id);
+                unsigned memoryNeeded = GetMemory(task_id);
+                
+                // If this machine matches requirements, try to use it
+                if (info.cpu == requiredCPU && 
+                    (!needsGPU || info.gpus) && 
+                    info.memory_used + memoryNeeded <= info.memory_size) {
+                    
+                    // Try to find or create a VM
+                    VMId_t targetVM = FindBestVM(task_id, GetTaskClass(task_id), 
+                                               requiredCPU, requiredVM, needsGPU, memoryNeeded);
+                    
+                    if (targetVM == VMId_t(-1)) {
+                        // Create new VM
+                        targetVM = CreateNewVM(requiredVM, requiredCPU, needsGPU, memoryNeeded);
+                    }
+                    
+                    if (targetVM != VMId_t(-1)) {
+                        // Add task to VM
+                        try {
+                            VM_AddTask(targetVM, task_id, HIGH_PRIORITY);
+                            
+                            // Set machine to high performance
+                            for (unsigned i = 0; i < info.num_cpus; i++) {
+                                Machine_SetCorePerformance(machine_id, i, P0);
+                            }
+                            
+                            // Remove from waiting list
+                            it = highPriorityTasks.erase(it);
+                            continue;
+                        } catch (...) {
+                            // Failed to add task, leave in waiting list
+                        }
+                    }
+                }
+                ++it;
+            }
+        }
+    } else if (info.s_state == S5) {
+        activeMachines.erase(machine_id);
+    }
+}
+
+bool Scheduler::RequestMachineStateChange(MachineId_t machineId, MachineState_t newState) {
+    try {
+        MachineInfo_t info = Machine_GetInfo(machineId);
+        
+        // If already in requested state, no need to change
+        if (info.s_state == newState) {
+            return true;
+        }
+        
+        // Check if we can change state
+        if (newState != S0 && HasActiveJobs(machineId)) {
+            SimOutput("Cannot change machine " + std::to_string(machineId) + 
+                     " to state " + std::to_string(newState) + " - has active jobs", 2);
+            return false;
+        }
+        
+        // Request state change
+        Machine_SetState(machineId, newState);
+        pendingStateChanges[machineId] = true;
+        
+        // Update active machines tracking
+        if (newState == S0) {
+            activeMachines.insert(machineId);
+        } else if (newState == S5) {
+            activeMachines.erase(machineId);
+        }
+        
+        return true;
+    } catch (const std::exception& e) {
+        SimOutput("ERROR in RequestMachineStateChange: " + std::string(e.what()), 1);
+        return false;
+    }
 }
 
 VMId_t Scheduler::CreateNewVM(VMType_t vmType, CPUType_t cpuType, bool needsGPU, unsigned memoryNeeded) {
@@ -909,9 +1248,11 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    SimOutput("SLAWarning(): Task " + std::to_string(task_id) + " at risk of SLA violation at time " + std::to_string(time), 2);
+    scheduler.HandleSLAWarning(time, task_id);
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
+    SimOutput("StateChangeComplete(): Machine " + std::to_string(machine_id) + " completed state change at time " + std::to_string(time), 3);
+    scheduler.HandleStateChangeComplete(time, machine_id);
 }

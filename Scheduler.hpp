@@ -44,7 +44,9 @@ public:
     void CreateVMsForAllCPUTypes();
     std::vector<VMId_t> GetCompatibleVMs(CPUType_t cpuType, VMType_t vmType);
     bool PrepareVMForMigration(VMId_t vm);
-    bool IsVMPendingMigration(VMId_t vm) const;
+    void HandleSLAWarning(Time_t time, TaskId_t task_id);
+    void HandleStateChangeComplete(Time_t time, MachineId_t machine_id);
+    bool RequestMachineStateChange(MachineId_t machineId, MachineState_t newState);
     
     // Task information helper functions
     TaskClass_t GetTaskClass(TaskId_t taskId);
@@ -70,6 +72,9 @@ private:
     std::map<VMId_t, MachineId_t> vmToMachine;
     std::set<MachineId_t> activeMachines;
     std::set<VMId_t> migratingVMs;
+    std::map<TaskId_t, bool> slaViolatedTasks;  // Track tasks with SLA violations
+    std::map<MachineId_t, bool> pendingStateChanges;  // Track machines with pending state changes
+    std::set<TaskId_t> highPriorityTasks;
 };
 
 #endif /* Scheduler_hpp */
