@@ -9,69 +9,57 @@
 #include <vector>
 #include <map>
 #include <set>
-#include <list>
 #include <algorithm>
-#include "Interfaces.h"
-#include "Internal_Interfaces.h"
 
-// Structure to track pending tasks with their SLA and urgency
-struct PendingTask {
-    TaskId_t task_id;
-    SLAType_t sla;
-    double urgency;
-};
+#include "Interfaces.h"
+#include "SimTypes.h"
 
 class Scheduler {
 public:
+    std::map<MachineId_t, std::map<unsigned, CPUPerformance_t>> cpuStates;
+    std::map<TaskId_t, Time_t> taskStartTimes;
+    std::map<TaskId_t, SLAType_t> taskSLAs;
+    const std::vector<VMId_t>& GetVMs() const { return vms; }
+    const std::vector<MachineId_t>& GetMachines() const { return machines; }
+    bool IsMachineActive(MachineId_t machine) const { 
+        return activeMachines.find(machine) != activeMachines.end(); 
+    }
+    bool SafeRemoveTask(VMId_t vm, TaskId_t task);
+    void ActivateMachine(MachineId_t machine) {
+        activeMachines.insert(machine);
+        machineUtilization[machine] = 0.0;
+    }
+    void DeactivateMachine(MachineId_t machine) {
+        activeMachines.erase(machine);
+    }
+    
+    void AddVM(VMId_t vm) {
+        vms.push_back(vm);
+    }
+    void ConsolidateVMs(Time_t now);
+    
     Scheduler() {}
     void Init();
     void MigrationComplete(Time_t time, VMId_t vm_id);
     void NewTask(Time_t now, TaskId_t task_id);
     void PeriodicCheck(Time_t now);
-    void Shutdown(Time_t now);
+    void Shutdown(Time_t time);
     void TaskComplete(Time_t now, TaskId_t task_id);
-    void StateChangeComplete(Time_t time, MachineId_t machine_id);
-
-    // Data structures (made public for SLAWarning function)
-    std::map<TaskId_t, VMId_t> task_vm_map;            // VM for each task
-    std::map<VMId_t, MachineId_t> vm_machine_map;      // Machine for each VM
-    std::set<MachineId_t> pending_state_changes;       // Machines with pending state changes
-    std::set<VMId_t> pending_migrations;               // VMs currently being migrated
-
+    
 private:
-    // Constants
-    static const Time_t SLA_THRESHOLD;
-    static const double LOAD_THRESHOLD_LOW;
-    static const double LOAD_THRESHOLD_HIGH;
-    static const unsigned INITIAL_ACTIVE_MACHINES;
-    static const MachineId_t INVALID_MACHINE = static_cast<MachineId_t>(-1);
+    // Thresholds for underload/overload detection
+    const double UNDERLOAD_THRESHOLD = 0.3;  // 30% utilization
+    const double OVERLOAD_THRESHOLD = 0.8;   // 80% utilization
     
-    // Helper methods
-    void ProcessPendingTasks(Time_t now);
-    MachineId_t FindBestMachine(const TaskInfo_t& task_info);
-    MachineId_t PowerOnNewMachine();
-    VMId_t FindOrCreateVM(MachineId_t machine_id, CPUType_t cpu_type);
-    void AdjustMachinePerformance(MachineId_t machine_id, double urgency, SLAType_t sla = SLA3);
-    void UpdateMachinePerformance(MachineId_t machine_id, Time_t now);
-    bool CheckSLAViolations(MachineId_t machine_id, Time_t now);
-    void CheckMachinePowerState(MachineId_t machine_id);
-    void CheckClusterLoad();
+    // Track machine utilization
+    std::map<MachineId_t, double> machineUtilization;
     
-    // Data structures
-    std::vector<unsigned> machine_task_count;          // Number of tasks per machine
-    std::vector<std::vector<VMId_t>> machine_vm_map;   // VMs on each machine
-    std::vector<PendingTask> pending_tasks;            // Tasks waiting for resources
+    // Track which machines are powered on
+    std::set<MachineId_t> activeMachines;
+    
+    // Lists of VMs and machines
+    std::vector<VMId_t> vms;
+    std::vector<MachineId_t> machines;
 };
-
-// Public interface functions called by the simulator
-extern void InitScheduler();
-extern void HandleNewTask(Time_t time, TaskId_t task_id);
-extern void HandleTaskCompletion(Time_t time, TaskId_t task_id);
-extern void MemoryWarning(Time_t time, MachineId_t machine_id);
-extern void MigrationDone(Time_t time, VMId_t vm_id);
-extern void SchedulerCheck(Time_t time);
-extern void SimulationComplete(Time_t time);
-extern void SLAWarning(Time_t time, TaskId_t task_id);
-extern void StateChangeComplete(Time_t time, MachineId_t machine_id);
 
 #endif /* Scheduler_hpp */
