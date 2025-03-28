@@ -2,615 +2,665 @@
 //  Scheduler.cpp
 //  CloudSim
 //
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
-//
 
 #include "Scheduler.hpp"
-#include "Internal_Interfaces.h"
+#include <algorithm>
+#include <map>
+#include <string>
+#include <iostream>
 
-static unsigned active_machines = 16;
-Scheduler scheduler;
+// Initialize static members
+const Time_t Scheduler::SLA_THRESHOLD = 100000; // 100ms in microseconds
+const double Scheduler::LOAD_THRESHOLD_LOW = 0.3;
+const double Scheduler::LOAD_THRESHOLD_HIGH = 0.7;
+const unsigned Scheduler::INITIAL_ACTIVE_MACHINES = 8;
+
+// Global scheduler instance
+static Scheduler Scheduler;
 
 void Scheduler::Init() {
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    
-    // Initialize tracking structures
-    last_energy_check = 0;
-    last_cluster_energy = 0;
+    SimOutput("Scheduler::Init(): Initializing DVFS-based scheduler", 1);
     
     // Get total number of machines
     unsigned total_machines = Machine_GetTotal();
-    active_machines = total_machines;
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 2);
     
-    // Store machine IDs and gather machine information
-    for(unsigned i = 0; i < total_machines; i++) {
-        MachineId_t machineId = MachineId_t(i);
-        machines.push_back(machineId);
-        MachineInfo_t info = Machine_GetInfo(machineId);
-        CPUType_t cpuType = info.cpu;
-        machine_has_gpu[i] = info.gpus;
-        machine_states[i] = S0; // Start all machines in active state
-        machine_cpus[i] = info.cpu;
-    }
+    // Initialize data structures
+    machine_task_count.resize(total_machines, 0);
+    machine_vm_map.resize(total_machines);
+    vm_machine_map.clear();
+    task_vm_map.clear();
+    pending_state_changes.clear();
+    pending_migrations.clear();
+    pending_tasks.clear();
     
-    // Create VMs with compatible CPU types for each active machine
-    for(unsigned i = 0; i < active_machines; i++) {
-        MachineId_t machine_id = machines[i];
-        // Create a VM with compatible CPU type
-        VMType_t vm_type = LINUX_RT; // Default VM type
-        if (machine_cpus[i] == ARM || machine_cpus[i] == X86) {
-            vm_type = WIN;
-        } else if (machine_cpus[i] == POWER) {
-            vm_type = AIX;
-        }
-        // Create VM with the same CPU type as the machine
-        VMId_t vm = VM_Create(vm_type, machine_cpus[i]);
-        vms.push_back(vm);
-        VM_Attach(vm, machine_id);
+    // Power on initial set of machines and create VMs
+    for (unsigned i = 0; i < total_machines; i++) {
+        MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
         
-        // Initialize load tracking
-        vm_load[vm] = 0;
-
-        VMId_t vm2 = VM_Create(vm_type, machine_cpus[i]);
-        vms.push_back(vm2);
-        VM_Attach(vm2, machine_id);
-        
-        // Initialize load tracking
-        vm_load[vm2] = 0;
-        VMId_t vm3 = VM_Create(vm_type, machine_cpus[i]);
-        vms.push_back(vm3);
-        VM_Attach(vm3, machine_id);
-        
-        // Initialize load tracking
-        vm_load[vm3] = 0;
-        VMId_t vm4 = VM_Create(vm_type, machine_cpus[i]);
-        vms.push_back(vm4);
-        VM_Attach(vm4, machine_id);
-        
-        // Initialize load tracking
-        vm_load[vm4] = 0;
-        // VMId_t vm5 = VM_Create(vm_type, machine_cpus[i]);
-        // vms.push_back(vm5);
-        // VM_Attach(vm5, machine_id);
-        
-        // // Initialize load tracking
-        // vm_load[vm5] = 0;
-        // VMId_t vm6 = VM_Create(vm_type, machine_cpus[i]);
-        // vms.push_back(vm6);
-        // VM_Attach(vm6, machine_id);
-        
-        // // Initialize load tracking
-        // vm_load[vm6] = 0;
-        // VMId_t vm7 = VM_Create(vm_type, machine_cpus[i]);
-        // vms.push_back(vm7);
-        // VM_Attach(vm7, machine_id);
-        
-        // // Initialize load tracking
-        // vm_load[vm7] = 0;
-        // VMId_t vm8 = VM_Create(vm_type, machine_cpus[i]);
-        // vms.push_back(vm8);
-        // VM_Attach(vm8, machine_id);
-        
-        // // Initialize load tracking
-        // vm_load[vm8] = 0;
-        SimOutput("Scheduler::Init(): Created VM " + to_string(vm) + 
-                  " with CPU type " + to_string(machine_cpus[i]) + 
-                  " attached to machine " + to_string(machine_id), 3);
-    }
-    
-    // Turn off machines that aren't being used initially to save power
-    for(unsigned i = active_machines; i < total_machines; i++) {
-        Machine_SetState(machines[i], S3);
-        machine_states[machines[i]] = S3;
-        SimOutput("Scheduler::Init(): Setting unused machine " + to_string(machines[i]) + " to S3 state", 2);
-    }
-    
-    SimOutput("Scheduler::Init(): Initialized " + to_string(vms.size()) + " VMs on compatible machines", 2);
-    
-    // Set initial P-states for active machines to balance performance and energy
-    for(unsigned i = 0; i < active_machines; i++) {
-        MachineId_t machine_id = machines[i];
-        MachineInfo_t info = Machine_GetInfo(machine_id);
-        
-        // Set all cores to a moderate performance level initially
-        for(unsigned core = 0; core < info.num_cpus; core++) {
-            Machine_SetCorePerformance(machine_id, core, P0);
+        if (i < INITIAL_ACTIVE_MACHINES) {
+            // Power on machine and track the pending state change
+            Machine_SetState(MachineId_t(i), S0);
+            pending_state_changes.insert(MachineId_t(i));
+            
+            // We'll create VMs when the state change is complete
+        } else {
+            // Power off unused machines
+            Machine_SetState(MachineId_t(i), S5);
+            SimOutput("Scheduler::Init(): Powered off machine " + to_string(i), 3);
         }
     }
+    
+    SimOutput("Scheduler::Init(): Scheduler initialized with " + 
+              to_string(INITIAL_ACTIVE_MACHINES) + " pending active machines", 1);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get task information - assuming there's a function to get task info
+    // Get task information
     TaskInfo_t task_info = GetTaskInfo(task_id);
     
-    // Store task metadata for future reference
-    task_sla[task_id] = task_info.required_sla;
-    task_arrival[task_id] = now;
+    // Calculate urgency factor based on deadline
+    Time_t time_to_deadline = task_info.target_completion - now;
+    uint64_t instructions = task_info.total_instructions;
+    double urgency = static_cast<double>(instructions) / time_to_deadline;
     
-    // Find the best VM for this task based on current load and task requirements
-    VMId_t selected_vm = findBestVMForTask(task_id);
+    SimOutput("Scheduler::NewTask(): New task " + to_string(task_id) + 
+              " with urgency factor " + to_string(urgency), 2);
     
-    // Assign task to selected VM with appropriate priority
-    Priority_t priority = (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) ? HIGH_PRIORITY : MID_PRIORITY;
-    VM_AddTask(selected_vm, task_id, priority);
+    // Try to find a machine immediately
+    MachineId_t target_machine = FindBestMachine(task_info);
     
-    // Update our tracking structures
-    vm_load[selected_vm]++;
-    vm_tasks[selected_vm].push_back(task_id);
-    task_to_vm[task_id] = selected_vm;
+    // If no suitable machine found, try to power on a new one
+    if (target_machine == INVALID_MACHINE) {
+        target_machine = PowerOnNewMachine();
+        
+        if (target_machine == INVALID_MACHINE || 
+            pending_state_changes.find(target_machine) != pending_state_changes.end()) {
+            // No machines available or machine is powering on, add to pending queue
+            pending_tasks.push_back(task_id);
+            SimOutput("Scheduler::NewTask(): Added task " + to_string(task_id) + 
+                      " to pending queue (size: " + to_string(pending_tasks.size()) + ")", 2);
+            return;
+        }
+    }
+    
+    // Find or create a VM on the target machine
+    VMId_t target_vm = FindOrCreateVM(target_machine, task_info.required_cpu);
+    
+    // Set the machine's CPU performance based on task urgency
+    AdjustMachinePerformance(target_machine, urgency);
+    
+    // Add the task to the VM
+    Priority_t priority = (urgency > 0.8) ? HIGH_PRIORITY : 
+                         (urgency > 0.4) ? MID_PRIORITY : LOW_PRIORITY;
+    VM_AddTask(target_vm, task_id, priority);
+    
+    // Update our mappings
+    task_vm_map[task_id] = target_vm;
+    machine_task_count[target_machine]++;
     
     SimOutput("Scheduler::NewTask(): Assigned task " + to_string(task_id) + 
-              " to VM " + to_string(selected_vm) + 
-              " (SLA: " + to_string(task_info.required_sla) + ")", 2);
-}
-
-VMId_t Scheduler::findBestVMForTask(TaskId_t task_id) {
-    // Priority queue to rank VMs by suitability (lower score is better)
-    priority_queue<pair<int, VMId_t>, vector<pair<int, VMId_t>>, greater<pair<int, VMId_t>>> candidates;
-    
-    // Get task info
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    bool needs_gpu = task_info.gpu_capable;
-    unsigned task_memory = task_info.required_memory;
-    CPUType_t ctype = task_info.required_cpu;
-    
-    for (size_t i = 0; i < vms.size(); i++) {
-        VMId_t vm = vms[i];
-        // Skip if VM is migrating
-        if (VM_IsPendingMigration(vm)) continue;
-        
-        // Get VM info to find its machine
-        VMInfo_t vm_info = VM_GetInfo(vm);
-        if (vm_info.cpu != ctype) continue; 
-        MachineId_t machine = vm_info.machine_id;
-        
-        // Base score is current load
-        int score = vm_load[vm] * 10;
-        
-        // If task needs GPU but machine doesn't have one, penalize heavily
-        if (needs_gpu && !machine_has_gpu[machine]) {
-            score += 1000;
-        }
-        
-        // Penalize machines in power saving modes
-        if (machine_states[machine] != S0) {
-            score += 50;
-        }
-        
-        // Check if machine has enough memory
-        MachineInfo_t machine_info = Machine_GetInfo(machine);
-        unsigned available_memory = machine_info.memory_size - machine_info.memory_used;
-        if (available_memory < task_memory) {
-            score += 500;
-        }
-        
-        candidates.push(make_pair(score, vm));
-    }
-    
-    // Return the best VM (if any available)
-    if (!candidates.empty()) {
-        return candidates.top().second;
-    }
-    
-    // Fallback to round-robin if no suitable VM found
-    static size_t next_vm = 0;
-    VMId_t selected = vms[next_vm];
-    next_vm = (next_vm + 1) % vms.size();
-    return selected;
+              " to VM " + to_string(target_vm) + 
+              " on machine " + to_string(target_machine) + 
+              " with priority " + to_string(priority), 3);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Find which VM was running this task
-    if (task_to_vm.find(task_id) == task_to_vm.end()) {
-        SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " not found in tracking", 1);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " completed", 2);
+    
+    // Find which VM and machine this task was running on
+    auto it = task_vm_map.find(task_id);
+    if (it == task_vm_map.end()) {
+        SimOutput("Scheduler::TaskComplete(): Warning - Task " + to_string(task_id) + 
+                  " not found in our records", 1);
         return;
     }
     
-    VMId_t vm = task_to_vm[task_id];
+    VMId_t vm_id = it->second;
     
-    // Update load tracking
-    vm_load[vm]--;
+    // Remove task from our mapping before calling VM_RemoveTask
+    // This prevents double removal
+    task_vm_map.erase(it);
     
-    // Remove task from VM's task list
-    auto& tasks = vm_tasks[vm];
-    tasks.erase(remove(tasks.begin(), tasks.end(), task_id), tasks.end());
-    
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + 
-              " completed on VM " + to_string(vm), 2);
-    
-    // Clean up tracking
-    task_to_vm.erase(task_id);
-    task_sla.erase(task_id);
-    task_arrival.erase(task_id);
-    
-    // Adjust machine states if needed
-    if (vm_load[vm] == 0) {
-        // Consider putting machine to sleep if no tasks
-        VMInfo_t vm_info = VM_GetInfo(vm);
-        MachineId_t machine = vm_info.machine_id;
-        
-        // Check if other VMs are using this machine
-        bool machine_in_use = false;
-        for (auto& vm_pair : vm_load) {
-            if (vm_pair.first != vm) {
-                VMInfo_t other_vm_info = VM_GetInfo(vm_pair.first);
-                if (other_vm_info.machine_id == machine && vm_pair.second > 0) {
-                    machine_in_use = true;
-                    break;
-                }
-            }
-        }
-        
-        // if (!machine_in_use) {
-        //     // Put machine into low power state
-        //     Machine_SetState(machine, S3);
-        //     machine_states[machine] = S3;
-        //     SimOutput("Scheduler::TaskComplete(): Setting machine " + to_string(machine) + " to S3 state", 2);
-        // }
+    // Update machine task count
+    MachineId_t machine_id = vm_machine_map[vm_id];
+    if (machine_task_count[machine_id] > 0) {
+        machine_task_count[machine_id]--;
     }
+    
+    // Check if we need to adjust machine performance
+    UpdateMachinePerformance(machine_id, now);
+    
+    // Check if we can power off the machine
+    CheckMachinePowerState(machine_id);
+    
+    // Process any pending tasks
+    ProcessPendingTasks(now);
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // Check energy consumption periodically
-    if (now - last_energy_check > 5000000) { // Every 5 seconds
-        double current_energy = Machine_GetClusterEnergy();
-        double energy_delta = current_energy - last_cluster_energy;
+    SimOutput("Scheduler::PeriodicCheck(): Performing periodic check at time " + 
+              to_string(now), 3);
+    
+    // Iterate through all machines
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
         
-        SimOutput("Scheduler::PeriodicCheck(): Cluster energy consumption: " + 
-                  to_string(energy_delta) + " since last check", 3);
-        
-        last_cluster_energy = current_energy;
-        last_energy_check = now;
-    }
-    
-    // Adjust machine states based on current load
-    adjustMachineStates();
-    
-    // Consider VM migrations to balance load
-    // migrateVMIfNeeded(now);
-}
-
-void Scheduler::adjustMachineStates() {
-    // Count active tasks per machine
-    map<MachineId_t, unsigned> machine_load;
-    
-    for (auto& vm_pair : vm_load) {
-        VMId_t vm = vm_pair.first;
-        unsigned load = vm_pair.second;
-        
-        VMInfo_t vm_info = VM_GetInfo(vm);
-        MachineId_t machine = vm_info.machine_id;
-        
-        machine_load[machine] += load;
-    }
-    
-    // Adjust machine states based on load
-    for (auto& machine_pair : machine_load) {
-        MachineId_t machine = machine_pair.first;
-        unsigned load = machine_pair.second;
-        
-        // if (load == 0 && machine_states[machine] == S0) {
-        //     // No tasks, put machine to sleep
-        //     Machine_SetState(machine, S3);
-        //     machine_states[machine] = S3;
-        //     SimOutput("Scheduler::adjustMachineStates(): Setting machine " + to_string(machine) + " to S3 state", 2);
-        // }
-        // else 
-        if (load > 0 && machine_states[machine] != S0) {
-            // Has tasks but not fully active, wake up
-            Machine_SetState(machine, S0);
-            machine_states[machine] = S0;
-            SimOutput("Scheduler::adjustMachineStates(): Setting machine " + to_string(machine) + " to S0 state", 2);
-        }
-    }
-}
-
-void Scheduler::migrateVMIfNeeded(Time_t now) {
-    
-    // Find overloaded and underloaded machines
-    vector<MachineId_t> overloaded;
-    vector<MachineId_t> underloaded;
-    
-    map<MachineId_t, unsigned> machine_load;
-    
-    // Calculate load per machine
-    for (auto& vm_pair : vm_load) {
-        VMId_t vm = vm_pair.first;
-        unsigned load = vm_pair.second;
-        
-        VMInfo_t vm_info = VM_GetInfo(vm);
-        MachineId_t machine = vm_info.machine_id;
-        
-        machine_load[machine] += load;
-    }
-    
-    // Determine average load
-    unsigned total_load = 0;
-    unsigned active_machine_count = 0;
-    for (auto& load_pair : machine_load) {
-        total_load += load_pair.second;
-        if (machine_states[load_pair.first] == S0) {
-            active_machine_count++;
-        }
-    }
-    
-    double avg_load = (active_machine_count > 0) ? total_load / (double)active_machine_count : 0;
-    
-    // Classify machines
-    for (auto& load_pair : machine_load) {
-        MachineId_t machine = load_pair.first;
-        unsigned load = load_pair.second;
-        
-        // Only consider active machines
-        if (machine_states[machine] != S0) {
+        // Skip machines that are powered off or in transition
+        if (info.s_state == S5 || 
+            pending_state_changes.find(MachineId_t(i)) != pending_state_changes.end()) {
             continue;
         }
         
-        if (load > avg_load * 1.5) {
-            overloaded.push_back(machine);
-        }
-        else if (load < avg_load * 0.5 && load > 0) {
-            underloaded.push_back(machine);
-        }
+        // Check for SLA violations and adjust performance
+        CheckSLAViolations(MachineId_t(i), now);
+        
+        // Update machine performance based on current load
+        UpdateMachinePerformance(MachineId_t(i), now);
+        
+        // Check if we can power off underutilized machines
+        CheckMachinePowerState(MachineId_t(i));
     }
     
-    // Attempt migrations from overloaded to underloaded
-    for (MachineId_t src : overloaded) {
-        if (underloaded.empty()) break;
-        
-        // Find VMs on this machine
-        vector<VMId_t> candidate_vms;
-        for (VMId_t vm : vms) {
-            VMInfo_t vm_info = VM_GetInfo(vm);
-            if (vm_info.machine_id == src && !VM_IsPendingMigration(vm)) {
-                candidate_vms.push_back(vm);
-            }
-        }
-        
-        // Sort VMs by load (descending)
-        sort(candidate_vms.begin(), candidate_vms.end(), 
-             [this](VMId_t a, VMId_t b) { return vm_load[a] > vm_load[b]; });
-        
-        // Try to migrate a VM
-        for (VMId_t vm : candidate_vms) {
-            // Get VM's CPU type
-            VMInfo_t vm_info = VM_GetInfo(vm);
-            CPUType_t vm_cpu_type = vm_info.cpu;
-            
-            // Calculate VM memory requirements
-            unsigned vm_memory = 0;
-            for (TaskId_t task : vm_tasks[vm]) {
-                TaskInfo_t task_info = GetTaskInfo(task);
-                vm_memory += task_info.required_memory;
-            }
-            
-            // Find compatible underloaded machines
-            for (auto it = underloaded.begin(); it != underloaded.end(); ) {
-                MachineId_t dest = *it;
-                
-                // Check CPU compatibility
-                CPUType_t dest_cpu_type = Machine_GetCPUType(dest);
-                if (vm_cpu_type != dest_cpu_type) {
-                    // CPU types are incompatible, try next machine
-                    ++it;
-                    continue;
-                }
-                
-                // Check if destination has enough resources
-                MachineInfo_t dest_info = Machine_GetInfo(dest);
-                unsigned available_memory = dest_info.memory_size - dest_info.memory_used;
-                
-                // Check if GPU requirements match
-                bool vm_needs_gpu = false;
-                for (TaskId_t task : vm_tasks[vm]) {
-                    TaskInfo_t task_info = GetTaskInfo(task);
-                    if (task_info.gpu_capable) {
-                        vm_needs_gpu = true;
-                        break;
-                    }
-                }
-                
-                // Skip if VM needs GPU but destination doesn't have one
-                if (vm_needs_gpu && !dest_info.gpus) {
-                    ++it;
-                    continue;
-                }
-                
-                if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD && !VM_IsPendingMigration(vm)) {
-                    // Initiate migration
-                    VM_MigrationStarted(vm);
-                    VM_Migrate(vm, dest);
-                    SimOutput("Scheduler::migrateVMIfNeeded(): Migrating VM " + to_string(vm) + 
-                              " from machine " + to_string(src) + 
-                              " to " + to_string(dest) + 
-                              " (CPU type: " + to_string(dest_cpu_type) + ")", 2);
-                    
-                    // Remove destination from underloaded list
-                    underloaded.erase(it);
-                    
-                    // Successfully migrated a VM, break out of the loop
-                    return;
-                }
-                
-                // This machine wasn't suitable, try the next one
-                ++it;
-            }
-        }
-    }
+    // Check if we need to power on additional machines due to high load
+    CheckClusterLoad();
     
-    // If we have idle machines in S3 state and overloaded machines, consider waking up a machine
-    if (!overloaded.empty()) {
-        for (MachineId_t machine : machines) {
-            if (machine_states[machine] == S3) {
-                // Wake up this machine
-                Machine_SetState(machine, S0);
-                machine_states[machine] = S0;
-                SimOutput("Scheduler::migrateVMIfNeeded(): Waking up machine " + to_string(machine) + 
-                          " to handle load imbalance", 2);
-                break;
-            }
-        }
-    }
+    // Process any pending tasks
+    ProcessPendingTasks(now);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) + 
               " migration completed at time " + to_string(time), 2);
     
-    VM_MigrationCompleted(vm_id);
+    // Update our data structures
+    pending_migrations.erase(vm_id);
+    
+    // Process any pending tasks that were waiting for this migration
+    ProcessPendingTasks(time);
 }
 
-void Scheduler::MemoryWarningHandler(Time_t time, MachineId_t machine_id) {
-    SimOutput("Scheduler::MemoryWarningHandler(): Memory warning on machine " + 
-              to_string(machine_id) + " at time " + to_string(time), 1);
+void Scheduler::StateChangeComplete(Time_t time, MachineId_t machine_id) {
+    SimOutput("Scheduler::StateChangeComplete(): Machine " + to_string(machine_id) + 
+              " state change completed at time " + to_string(time), 2);
     
-    // Find VMs on this machine
-    vector<VMId_t> machine_vms;
-    for (VMId_t vm : vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm);
-        if (vm_info.machine_id == machine_id) {
-            machine_vms.push_back(vm);
-        }
-    }
+    // Remove from pending state changes
+    pending_state_changes.erase(machine_id);
     
-    // Sort VMs by memory usage (descending)
-    sort(machine_vms.begin(), machine_vms.end(), 
-         [this](VMId_t a, VMId_t b) {
-             unsigned mem_a = 0, mem_b = 0;
-             for (TaskId_t task : vm_tasks[a]) {
-                 TaskInfo_t task_info = GetTaskInfo(task);
-                 mem_a += task_info.required_memory;
-             }
-             for (TaskId_t task : vm_tasks[b]) {
-                 TaskInfo_t task_info = GetTaskInfo(task);
-                 mem_b += task_info.required_memory;
-             }
-             return mem_a > mem_b;
-         });
-    
-    // Find a target machine with available memory
-    for (VMId_t vm : machine_vms) {
-        if (VM_IsPendingMigration(vm)) continue;
-        // Calculate VM memory usage
-        unsigned vm_memory = 0;
-        for (TaskId_t task : vm_tasks[vm]) {
-            TaskInfo_t task_info = GetTaskInfo(task);
-            vm_memory += task_info.required_memory;
+    // If the machine is now powered on (S0), initialize it
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.s_state == S0) {
+        // Set all cores to maximum performance initially
+        for (unsigned j = 0; j < info.num_cpus; j++) {
+            Machine_SetCorePerformance(machine_id, j, P0);
         }
         
-        // Find a suitable destination
-        for (MachineId_t dest : machines) {
-            // if (dest == machine_id) continue;
+        // Create a VM for this machine if it doesn't already have one
+        if (machine_vm_map[machine_id].empty()) {
+            VMId_t vm_id = VM_Create(LINUX, info.cpu);
+            VM_Attach(vm_id, machine_id);
             
-            MachineInfo_t dest_info = Machine_GetInfo(dest);
-            unsigned available_memory = dest_info.memory_size - dest_info.memory_used;
+            // Update our mappings
+            machine_vm_map[machine_id].push_back(vm_id);
+            vm_machine_map[vm_id] = machine_id;
             
-            if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD) {
-                // Migrate VM to destination
-                VM_MigrationStarted(vm);
-                VM_Migrate(vm, dest);
-                SimOutput("Scheduler::MemoryWarningHandler(): Migrating VM " + to_string(vm) + 
-                          " from machine " + to_string(machine_id) + " to " + to_string(dest), 2);
-                return;
-            }
+            SimOutput("Scheduler::StateChangeComplete(): Created VM " + to_string(vm_id) + 
+                      " on newly active machine " + to_string(machine_id), 3);
         }
     }
     
-    SimOutput("Scheduler::MemoryWarningHandler(): No suitable migration target found", 1);
+    // Process any pending tasks that were waiting for this state change
+    ProcessPendingTasks(time);
 }
 
 void Scheduler::Shutdown(Time_t now) {
     SimOutput("Scheduler::Shutdown(): Shutting down at time " + to_string(now), 1);
     
-    // Final energy report
-    double total_energy = Machine_GetClusterEnergy();
-    SimOutput("Scheduler::Shutdown(): Total energy consumed: " + to_string(total_energy), 1);
+    // Shutdown all VMs
+    for (auto& vm_pair : vm_machine_map) {
+        VM_Shutdown(vm_pair.first);
+    }
+    
+    // Power off all machines
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        Machine_SetState(MachineId_t(i), S5);
+    }
+    
+    SimOutput("Scheduler::Shutdown(): All resources released", 1);
 }
 
-TaskClass_t GetTaskClass(TaskId_t task_id) {
-    // Get task information
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    
-    // Get remaining instructions as a measure of task length
-    uint64_t remaining_inst = task_info.remaining_instructions;
-    
-    // Check if task can benefit from GPU
-    bool gpu_capable = IsTaskGPUCapable(task_id);
-    
-    // Check memory requirements (higher memory might indicate compute-intensive tasks)
-    unsigned memory_req = GetTaskMemory(task_id);
-    
-    // Determine task class based on heuristics
-    
-    // AI: Compute-intensive and can benefit from GPU
-    if (gpu_capable && memory_req > 1024 && remaining_inst > 1000000) {
-        return AI_TRAINING;
+void Scheduler::ProcessPendingTasks(Time_t now) {
+    // Process pending tasks if we have any
+    while (!pending_tasks.empty()) {
+        TaskId_t task_id = pending_tasks.front();
+        
+        // Get task information
+        TaskInfo_t task_info = GetTaskInfo(task_id);
+        
+        // Calculate urgency
+        Time_t time_to_deadline = task_info.target_completion - now;
+        uint64_t instructions = task_info.remaining_instructions;
+        double urgency = static_cast<double>(instructions) / time_to_deadline;
+        
+        // Find the best machine
+        MachineId_t target_machine = FindBestMachine(task_info);
+        
+        // If no suitable machine, try to power on a new one
+        if (target_machine == INVALID_MACHINE) {
+            target_machine = PowerOnNewMachine();
+            
+            if (target_machine == INVALID_MACHINE || 
+                pending_state_changes.find(target_machine) != pending_state_changes.end()) {
+                // No machines available or machine is powering on, keep in queue
+                break;
+            }
+        }
+        
+        // Remove from pending queue
+        pending_tasks.pop_front();
+        
+        // Find or create a VM
+        VMId_t target_vm = FindOrCreateVM(target_machine, task_info.required_cpu);
+        
+        // Set machine performance
+        AdjustMachinePerformance(target_machine, urgency);
+        
+        // Add task to VM
+        Priority_t priority = (urgency > 0.8) ? HIGH_PRIORITY : 
+                             (urgency > 0.4) ? MID_PRIORITY : LOW_PRIORITY;
+        VM_AddTask(target_vm, task_id, priority);
+        
+        // Update mappings
+        task_vm_map[task_id] = target_vm;
+        machine_task_count[target_machine]++;
+        
+        SimOutput("Scheduler::ProcessPendingTasks(): Assigned pending task " + 
+                  to_string(task_id) + " to VM " + to_string(target_vm) + 
+                  " on machine " + to_string(target_machine), 2);
     }
-    
-    // CRYPTO: Compute-intensive, short, but repetitive, GPU-enabled
-    if (gpu_capable && remaining_inst < 500000 && memory_req < 512) {
-        return CRYPTO;
-    }
-    
-    // HPC (Scientific): Compute-intensive, very long, can benefit from GPU
-    if (gpu_capable && remaining_inst > 5000000) {
-        return SCIENTIFIC;
-    }
-    
-    // STREAMING: Compute-intensive, short bursts
-    if (remaining_inst > 100000 && remaining_inst < 1000000 && memory_req > 512) {
-        return STREAMING;
-    }
-    
-    // WEB: Short requests (default case)
-    return WEB_REQUEST;
 }
 
-// External interface functions that will be called by the simulator
+MachineId_t Scheduler::FindBestMachine(const TaskInfo_t& task_info) {
+    MachineId_t best_machine = INVALID_MACHINE;
+    double best_score = std::numeric_limits<double>::max();
+    
+    // Iterate through all machines
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineInfo_t machine_info = Machine_GetInfo(MachineId_t(i));
+        
+        // Skip machines that are powered off or in transition
+        if (machine_info.s_state == S5 || 
+            pending_state_changes.find(MachineId_t(i)) != pending_state_changes.end()) {
+            continue;
+        }
+        
+        // Skip machines with VMs that are being migrated
+        bool has_migrating_vm = false;
+        for (VMId_t vm_id : machine_vm_map[i]) {
+            if (pending_migrations.find(vm_id) != pending_migrations.end() ||
+                VM_IsPendingMigration(vm_id)) {
+                has_migrating_vm = true;
+                break;
+            }
+        }
+        if (has_migrating_vm) continue;
+        
+        // Check if machine meets requirements
+        if (machine_info.cpu != task_info.required_cpu) continue;
+        if (task_info.gpu_capable && !machine_info.gpus) continue;
+        if (machine_info.memory_used + task_info.required_memory > machine_info.memory_size) continue;
+        
+        // Calculate a score based on current load
+        double load = static_cast<double>(machine_info.active_tasks) / machine_info.num_cpus;
+        double score = load;
+        
+        // Prefer machines that are already running
+        if (load < LOAD_THRESHOLD_LOW) {
+            score -= 0.2;  // Bonus for underutilized machines
+        }
+        
+        // Update best machine if this one has a better score
+        if (score < best_score) {
+            best_score = score;
+            best_machine = MachineId_t(i);
+        }
+    }
+    
+    return best_machine;
+}
+
+MachineId_t Scheduler::PowerOnNewMachine() {
+    // Find a powered-off machine that's not in transition
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
+        
+        if (info.s_state == S5 && 
+            pending_state_changes.find(MachineId_t(i)) == pending_state_changes.end()) {
+            // Power on the machine
+            Machine_SetState(MachineId_t(i), S0);
+            
+            // Mark as pending state change
+            pending_state_changes.insert(MachineId_t(i));
+            
+            SimOutput("Scheduler::PowerOnNewMachine(): Powering on machine " + 
+                      to_string(i), 2);
+            
+            return MachineId_t(i);
+        }
+    }
+    
+    return INVALID_MACHINE;
+}
+
+VMId_t Scheduler::FindOrCreateVM(MachineId_t machine_id, CPUType_t cpu_type) {
+    // Check if there's an existing VM on this machine that's not migrating
+    for (VMId_t vm_id : machine_vm_map[machine_id]) {
+        if (pending_migrations.find(vm_id) == pending_migrations.end()
+            && !VM_IsPendingMigration(vm_id)) {
+            return vm_id;
+        }
+    }
+    
+    // Create a new VM
+    VMId_t vm_id = VM_Create(LINUX, cpu_type);
+    VM_Attach(vm_id, machine_id);
+    
+    // Update our mappings
+    machine_vm_map[machine_id].push_back(vm_id);
+    vm_machine_map[vm_id] = machine_id;
+    
+    SimOutput("Scheduler::FindOrCreateVM(): Created new VM " + to_string(vm_id) + 
+              " on machine " + to_string(machine_id), 3);
+    
+    return vm_id;
+}
+
+void Scheduler::AdjustMachinePerformance(MachineId_t machine_id, double urgency) {
+    // Skip machines in transition
+    if (pending_state_changes.find(machine_id) != pending_state_changes.end()) {
+        return;
+    }
+    
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    CPUPerformance_t target_state;
+    
+    // Set performance based on urgency
+    if (urgency > 0.8) {
+        target_state = P0;  // High urgency - maximum performance
+    } else if (urgency > 0.5) {
+        target_state = P1;  // Medium urgency
+    } else if (urgency > 0.3) {
+        target_state = P2;  // Low urgency
+    } else {
+        target_state = P3;  // Very low urgency - minimum performance
+    }
+    
+    // Apply the performance state to all cores
+    for (unsigned j = 0; j < info.num_cpus; j++) {
+        Machine_SetCorePerformance(machine_id, j, target_state);
+    }
+    
+    SimOutput("Scheduler::AdjustMachinePerformance(): Set machine " + 
+              to_string(machine_id) + " to P-state " + to_string(target_state), 3);
+}
+
+void Scheduler::UpdateMachinePerformance(MachineId_t machine_id, Time_t now) {
+    // Skip machines in transition
+    if (pending_state_changes.find(machine_id) != pending_state_changes.end()) {
+        return;
+    }
+    
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    
+    // Calculate load factor
+    double load = static_cast<double>(info.active_tasks) / info.num_cpus;
+    
+    // Check for SLA violations first
+    bool has_urgent_tasks = CheckSLAViolations(machine_id, now);
+    
+    // If no urgent tasks, adjust based on load
+    if (!has_urgent_tasks) {
+        CPUPerformance_t target_state;
+        
+        if (load > LOAD_THRESHOLD_HIGH) {
+            target_state = P0;  // High load - maximum performance
+        } else if (load > LOAD_THRESHOLD_LOW) {
+            target_state = P1;  // Medium load
+        } else if (load > 0.1) {
+            target_state = P2;  // Low load
+        } else {
+            target_state = P3;  // Very low load - minimum performance
+        }
+        
+        // Apply the performance state to all cores
+        for (unsigned j = 0; j < info.num_cpus; j++) {
+            Machine_SetCorePerformance(machine_id, j, target_state);
+        }
+        
+        SimOutput("Scheduler::UpdateMachinePerformance(): Updated machine " + 
+                  to_string(machine_id) + " to P-state " + to_string(target_state) + 
+                  " based on load " + to_string(load), 3);
+    }
+}
+
+bool Scheduler::CheckSLAViolations(MachineId_t machine_id, Time_t now) {
+    // Skip machines in transition
+    if (pending_state_changes.find(machine_id) != pending_state_changes.end()) {
+        return false;
+    }
+    
+    bool has_urgent_tasks = false;
+    
+    // Check all VMs on this machine
+    for (VMId_t vm_id : machine_vm_map[machine_id]) {
+        // Skip VMs that are being migrated
+        if (pending_migrations.find(vm_id) != pending_migrations.end() ||
+            VM_IsPendingMigration(vm_id)) {
+            continue;
+        }
+        
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        
+        // Check all tasks on this VM
+        for (TaskId_t task_id : vm_info.active_tasks) {
+            TaskInfo_t task_info = GetTaskInfo(task_id);
+            
+            // Check if this task is in danger of violating its SLA
+            Time_t time_to_deadline = task_info.target_completion - now;
+            uint64_t remaining = GetRemainingInstructions(task_id);
+            
+            // Calculate required MIPS to meet deadline
+            double required_mips = static_cast<double>(remaining) / time_to_deadline;
+            
+            // Get machine's current MIPS rating
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            double current_mips = machine_info.performance[machine_info.p_state];
+            
+            // If we need more performance to meet deadline
+            if (required_mips > current_mips * 0.9) {
+                has_urgent_tasks = true;
+                
+                // Set machine to maximum performance
+                for (unsigned j = 0; j < machine_info.num_cpus; j++) {
+                    Machine_SetCorePerformance(machine_id, j, P0);
+                }
+                
+                SimOutput("Scheduler::CheckSLAViolations(): Boosted machine " + 
+                          to_string(machine_id) + " to P0 for task " + 
+                          to_string(task_id) + " to avoid SLA violation", 2);
+                
+                break;  // No need to check other tasks
+            }
+        }
+        
+        if (has_urgent_tasks) break;  // No need to check other VMs
+    }
+    
+    return has_urgent_tasks;
+}
+
+void Scheduler::CheckMachinePowerState(MachineId_t machine_id) {
+    // Skip machines in transition
+    if (pending_state_changes.find(machine_id) != pending_state_changes.end()) {
+        return;
+    }
+    
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    
+    // If machine has no tasks, consider powering it off
+    if (info.active_tasks == 0) {
+        // Make sure we keep a minimum number of machines running
+        unsigned active_count = 0;
+        for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+            MachineInfo_t m_info = Machine_GetInfo(MachineId_t(i));
+            if (m_info.s_state != S5 && 
+                pending_state_changes.find(MachineId_t(i)) == pending_state_changes.end()) {
+                active_count++;
+            }
+        }
+        
+        if (active_count > INITIAL_ACTIVE_MACHINES) {
+            // Check if any VMs on this machine are being migrated
+            bool has_migrating_vm = false;
+            for (VMId_t vm_id : machine_vm_map[machine_id]) {
+                if (pending_migrations.find(vm_id) != pending_migrations.end() ||
+                    VM_IsPendingMigration(vm_id)) {
+                    has_migrating_vm = true;
+                    break;
+                }
+            }
+            
+            if (!has_migrating_vm) {
+                // Shutdown all VMs on this machine first
+                for (VMId_t vm_id : machine_vm_map[machine_id]) {
+                    VM_Shutdown(vm_id);
+                    vm_machine_map.erase(vm_id);
+                }
+                machine_vm_map[machine_id].clear();
+                
+                // Power off the machine
+                Machine_SetState(machine_id, S5);
+                pending_state_changes.insert(machine_id);
+                
+                SimOutput("Scheduler::CheckMachinePowerState(): Powering off idle machine " + 
+                          to_string(machine_id), 2);
+            }
+        }
+    }
+}
+
+void Scheduler::CheckClusterLoad() {
+    // Calculate overall cluster load
+    unsigned total_active_tasks = 0;
+    unsigned total_active_cores = 0;
+    
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
+        
+        // Only count machines that are active and not in transition
+        if (info.s_state != S5 && 
+            pending_state_changes.find(MachineId_t(i)) == pending_state_changes.end()) {
+            total_active_tasks += info.active_tasks;
+            total_active_cores += info.num_cpus;
+        }
+    }
+    
+    // Avoid division by zero
+    if (total_active_cores == 0) return;
+    
+    double cluster_load = static_cast<double>(total_active_tasks) / total_active_cores;
+    
+    // If cluster load is high, consider powering on more machines
+    if (cluster_load > LOAD_THRESHOLD_HIGH || !pending_tasks.empty()) {
+        PowerOnNewMachine();
+        
+        SimOutput("Scheduler::CheckClusterLoad(): Powered on additional machine due to high cluster load " + 
+                  to_string(cluster_load) + " or pending tasks", 2);
+    }
+}
+
+// Public interface functions called by the simulator
+
 void InitScheduler() {
-    scheduler.Init();
+    SimOutput("InitScheduler(): Initializing scheduler", 4);
+    Scheduler.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
-    scheduler.NewTask(time, task_id);
+    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + 
+              " at time " + to_string(time), 4);
+    Scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    scheduler.TaskComplete(time, task_id);
-}
-
-void SchedulerCheck(Time_t time) {
-    scheduler.PeriodicCheck(time);
+    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + 
+              " completed at time " + to_string(time), 4);
+    Scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // scheduler.MemoryWarningHandler(time, machine_id);
+    SimOutput("MemoryWarning(): Memory warning on machine " + to_string(machine_id) + 
+              " at time " + to_string(time), 2);
+    
+    // Could implement VM migration or task reallocation here
+    // For now, just log the warning
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    scheduler.MigrationComplete(time, vm_id);
+    SimOutput("MigrationDone(): VM " + to_string(vm_id) + 
+              " migration completed at time " + to_string(time), 3);
+    Scheduler.MigrationComplete(time, vm_id);
+}
+
+void SchedulerCheck(Time_t time) {
+    SimOutput("SchedulerCheck(): Periodic check at time " + to_string(time), 4);
+    Scheduler.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
+    SimOutput("SimulationComplete(): Simulation completed at time " + to_string(time), 2);
+    
+    // Report final statistics
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    scheduler.Shutdown(time);
+    
+    // Shutdown the scheduler
+    Scheduler.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    SimOutput("SLAWarning(): SLA warning for task " + to_string(task_id) + " at time " + to_string(time), 2);
-    // Boost priority for this task if we're tracking it
-    if (scheduler.task_to_vm.find(task_id) != scheduler.task_to_vm.end()) {
-        SetTaskPriority(task_id, HIGH_PRIORITY);
+    SimOutput("SLAWarning(): SLA warning for task " + to_string(task_id) + 
+              " at time " + to_string(time), 2);
+    
+    // Find which VM and machine this task is running on
+    auto it = Scheduler.task_vm_map.find(task_id);
+    if (it != Scheduler.task_vm_map.end()) {
+        VMId_t vm_id = it->second;
+        MachineId_t machine_id = Scheduler.vm_machine_map[vm_id];
+        
+        // Skip machines in transition
+        if (Scheduler.pending_state_changes.find(machine_id) != Scheduler.pending_state_changes.end()) {
+            return;
+        }
+        
+        // Boost the machine to maximum performance
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        for (unsigned j = 0; j < info.num_cpus; j++) {
+            Machine_SetCorePerformance(machine_id, j, P0);
+        }
+        
+        SimOutput("SLAWarning(): Boosted machine " + to_string(machine_id) + 
+                  " to P0 for task " + to_string(task_id), 2);
     }
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    SimOutput("StateChangeComplete(): Machine " + to_string(machine_id) + " state change completed at time " + to_string(time), 3);
+    SimOutput("StateChangeComplete(): Machine " + to_string(machine_id) + 
+              " state change completed at time " + to_string(time), 3);
+    
+    Scheduler.StateChangeComplete(time, machine_id);
 }
