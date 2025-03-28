@@ -58,7 +58,42 @@ void Scheduler::Init() {
         
         // Initialize load tracking
         vm_load[vm2] = 0;
+        VMId_t vm3 = VM_Create(vm_type, machine_cpus[i]);
+        vms.push_back(vm3);
+        VM_Attach(vm3, machine_id);
         
+        // Initialize load tracking
+        vm_load[vm3] = 0;
+        VMId_t vm4 = VM_Create(vm_type, machine_cpus[i]);
+        vms.push_back(vm4);
+        VM_Attach(vm4, machine_id);
+        
+        // Initialize load tracking
+        vm_load[vm4] = 0;
+        // VMId_t vm5 = VM_Create(vm_type, machine_cpus[i]);
+        // vms.push_back(vm5);
+        // VM_Attach(vm5, machine_id);
+        
+        // // Initialize load tracking
+        // vm_load[vm5] = 0;
+        // VMId_t vm6 = VM_Create(vm_type, machine_cpus[i]);
+        // vms.push_back(vm6);
+        // VM_Attach(vm6, machine_id);
+        
+        // // Initialize load tracking
+        // vm_load[vm6] = 0;
+        // VMId_t vm7 = VM_Create(vm_type, machine_cpus[i]);
+        // vms.push_back(vm7);
+        // VM_Attach(vm7, machine_id);
+        
+        // // Initialize load tracking
+        // vm_load[vm7] = 0;
+        // VMId_t vm8 = VM_Create(vm_type, machine_cpus[i]);
+        // vms.push_back(vm8);
+        // VM_Attach(vm8, machine_id);
+        
+        // // Initialize load tracking
+        // vm_load[vm8] = 0;
         SimOutput("Scheduler::Init(): Created VM " + to_string(vm) + 
                   " with CPU type " + to_string(machine_cpus[i]) + 
                   " attached to machine " + to_string(machine_id), 3);
@@ -80,7 +115,7 @@ void Scheduler::Init() {
         
         // Set all cores to a moderate performance level initially
         for(unsigned core = 0; core < info.num_cpus; core++) {
-            Machine_SetCorePerformance(machine_id, core, P1);
+            Machine_SetCorePerformance(machine_id, core, P0);
         }
     }
 }
