@@ -84,6 +84,18 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
     }
     
+    // Double-check that the machine is ready
+    MachineInfo_t machine_info = Machine_GetInfo(target_machine);
+    if (machine_info.s_state != S0 || 
+        pending_state_changes.find(target_machine) != pending_state_changes.end()) {
+        // Machine is not ready, add to pending queue
+        pending_tasks.push_back(task_id);
+        SimOutput("Scheduler::NewTask(): Machine " + to_string(target_machine) + 
+                  " not ready, added task " + to_string(task_id) + 
+                  " to pending queue", 2);
+        return;
+    }
+    
     // Find or create a VM on the target machine
     VMId_t target_vm = FindOrCreateVM(target_machine, task_info.required_cpu);
     
@@ -229,6 +241,7 @@ void Scheduler::Shutdown(Time_t now) {
     SimOutput("Scheduler::Shutdown(): All resources released", 1);
 }
 
+// In the ProcessPendingTasks method, add a check to ensure the machine is ready
 void Scheduler::ProcessPendingTasks(Time_t now) {
     // Process pending tasks if we have any
     while (!pending_tasks.empty()) {
@@ -256,6 +269,14 @@ void Scheduler::ProcessPendingTasks(Time_t now) {
             }
         }
         
+        // Check if the machine is ready to accept tasks
+        MachineInfo_t machine_info = Machine_GetInfo(target_machine);
+        if (machine_info.s_state != S0 || 
+            pending_state_changes.find(target_machine) != pending_state_changes.end()) {
+            // Machine is not ready, keep task in queue
+            break;
+        }
+        
         // Remove from pending queue
         pending_tasks.pop_front();
         
@@ -268,6 +289,8 @@ void Scheduler::ProcessPendingTasks(Time_t now) {
         // Add task to VM
         Priority_t priority = (urgency > 0.8) ? HIGH_PRIORITY : 
                              (urgency > 0.4) ? MID_PRIORITY : LOW_PRIORITY;
+        
+        // Add a small delay before adding the task to ensure CPU state is stable
         VM_AddTask(target_vm, task_id, priority);
         
         // Update mappings
@@ -395,13 +418,16 @@ void Scheduler::AdjustMachinePerformance(MachineId_t machine_id, double urgency)
         target_state = P3;  // Very low urgency - minimum performance
     }
     
-    // Apply the performance state to all cores
-    for (unsigned j = 0; j < info.num_cpus; j++) {
-        Machine_SetCorePerformance(machine_id, j, target_state);
+    // Only change if different from current state
+    if (info.p_state != target_state) {
+        // Apply the performance state to all cores
+        for (unsigned j = 0; j < info.num_cpus; j++) {
+            Machine_SetCorePerformance(machine_id, j, target_state);
+        }
+        
+        SimOutput("Scheduler::AdjustMachinePerformance(): Set machine " + 
+                  to_string(machine_id) + " to P-state " + to_string(target_state), 3);
     }
-    
-    SimOutput("Scheduler::AdjustMachinePerformance(): Set machine " + 
-              to_string(machine_id) + " to P-state " + to_string(target_state), 3);
 }
 
 void Scheduler::UpdateMachinePerformance(MachineId_t machine_id, Time_t now) {
@@ -647,14 +673,22 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
             return;
         }
         
-        // Boost the machine to maximum performance
+        // Get current machine info
         MachineInfo_t info = Machine_GetInfo(machine_id);
-        for (unsigned j = 0; j < info.num_cpus; j++) {
-            Machine_SetCorePerformance(machine_id, j, P0);
-        }
         
-        SimOutput("SLAWarning(): Boosted machine " + to_string(machine_id) + 
-                  " to P0 for task " + to_string(task_id), 2);
+        // Only boost if not already at P0
+        if (info.p_state != P0) {
+            // Boost the machine to maximum performance
+            for (unsigned j = 0; j < info.num_cpus; j++) {
+                Machine_SetCorePerformance(machine_id, j, P0);
+            }
+            
+            SimOutput("SLAWarning(): Boosted machine " + to_string(machine_id) + 
+                      " to P0 for task " + to_string(task_id), 2);
+        } else {
+            SimOutput("SLAWarning(): Machine " + to_string(machine_id) + 
+                      " already at P0 for task " + to_string(task_id), 3);
+        }
     }
 }
 
