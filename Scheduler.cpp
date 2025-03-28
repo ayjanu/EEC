@@ -233,7 +233,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     adjustMachineStates();
     
     // Consider VM migrations to balance load
-    migrateVMIfNeeded(now);
+    // migrateVMIfNeeded(now);
 }
 
 void Scheduler::adjustMachineStates() {
@@ -473,7 +473,7 @@ void Scheduler::MemoryWarningHandler(Time_t time, MachineId_t machine_id) {
             
             if (available_memory >= vm_memory + VM_MEMORY_OVERHEAD) {
                 // Migrate VM to destination
-                // VM_MigrationStarted(vm);
+                VM_MigrationStarted(vm);
                 VM_Migrate(vm, dest);
                 SimOutput("Scheduler::MemoryWarningHandler(): Migrating VM " + to_string(vm) + 
                           " from machine " + to_string(machine_id) + " to " + to_string(dest), 2);
@@ -550,7 +550,7 @@ void SchedulerCheck(Time_t time) {
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    scheduler.MemoryWarningHandler(time, machine_id);
+    // scheduler.MemoryWarningHandler(time, machine_id);
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
