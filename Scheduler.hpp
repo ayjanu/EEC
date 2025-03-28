@@ -9,9 +9,17 @@
 #include <vector>
 #include <map>
 #include <set>
-#include <deque>
+#include <list>
+#include <algorithm>
 #include "Interfaces.h"
 #include "Internal_Interfaces.h"
+
+// Structure to track pending tasks with their SLA and urgency
+struct PendingTask {
+    TaskId_t task_id;
+    SLAType_t sla;
+    double urgency;
+};
 
 class Scheduler {
 public:
@@ -39,12 +47,11 @@ private:
     static const MachineId_t INVALID_MACHINE = static_cast<MachineId_t>(-1);
     
     // Helper methods
-    bool AreAllMachinesBusy();
     void ProcessPendingTasks(Time_t now);
     MachineId_t FindBestMachine(const TaskInfo_t& task_info);
     MachineId_t PowerOnNewMachine();
     VMId_t FindOrCreateVM(MachineId_t machine_id, CPUType_t cpu_type);
-    void AdjustMachinePerformance(MachineId_t machine_id, double urgency);
+    void AdjustMachinePerformance(MachineId_t machine_id, double urgency, SLAType_t sla = SLA3);
     void UpdateMachinePerformance(MachineId_t machine_id, Time_t now);
     bool CheckSLAViolations(MachineId_t machine_id, Time_t now);
     void CheckMachinePowerState(MachineId_t machine_id);
@@ -53,7 +60,7 @@ private:
     // Data structures
     std::vector<unsigned> machine_task_count;          // Number of tasks per machine
     std::vector<std::vector<VMId_t>> machine_vm_map;   // VMs on each machine
-    std::deque<TaskId_t> pending_tasks;                // Tasks waiting for resources
+    std::vector<PendingTask> pending_tasks;            // Tasks waiting for resources
 };
 
 // Public interface functions called by the simulator

@@ -13,7 +13,7 @@
 const Time_t Scheduler::SLA_THRESHOLD = 100000; // 100ms in microseconds
 const double Scheduler::LOAD_THRESHOLD_LOW = 0.3;
 const double Scheduler::LOAD_THRESHOLD_HIGH = 0.7;
-const unsigned Scheduler::INITIAL_ACTIVE_MACHINES = 8;
+const unsigned Scheduler::INITIAL_ACTIVE_MACHINES = 12; // Increased from 8 to handle more load initially
 
 // Global scheduler instance
 static Scheduler Scheduler;
@@ -37,9 +37,17 @@ void Scheduler::Init() {
     // Power on initial set of machines and create VMs
     for (unsigned i = 0; i < total_machines; i++) {
         MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
-        
+        VMType_t vt = LINUX;
+        if (info.cpu == X86 || info.cpu == ARM) {
+            vt = WIN;
+        } else if (info.cpu == POWER) {
+            vt = AIX;
+        }
         if (i < INITIAL_ACTIVE_MACHINES) {
             // Power on machine and track the pending state change
+            VMId_t vm = VM_Create(vt, info.cpu);
+            VM_Attach(vm, info.machine_id);
+            machine_vm_map[info.machine_id].push_back(vm);
             Machine_SetState(MachineId_t(i), S0);
             pending_state_changes.insert(MachineId_t(i));
             
@@ -67,44 +75,43 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     SimOutput("Scheduler::NewTask(): New task " + to_string(task_id) + 
               " with urgency factor " + to_string(urgency), 2);
     
-    // Try to find a machine immediately
+    // Try to assign the task immediately for better SLA compliance
     MachineId_t target_machine = FindBestMachine(task_info);
     
     // If no suitable machine found, try to power on a new one
     if (target_machine == INVALID_MACHINE) {
+        // Check if we can power on a new machine
         target_machine = PowerOnNewMachine();
         
         if (target_machine == INVALID_MACHINE || 
             pending_state_changes.find(target_machine) != pending_state_changes.end()) {
-            // No machines available or machine is powering on, add to pending queue
-            pending_tasks.push_back(task_id);
+            // No machines available or machine is powering on
+            // Add to pending queue with SLA information
+            pending_tasks.push_back({task_id, task_info.required_sla, urgency});
             SimOutput("Scheduler::NewTask(): Added task " + to_string(task_id) + 
                       " to pending queue (size: " + to_string(pending_tasks.size()) + ")", 2);
             return;
         }
     }
     
-    // Double-check that the machine is ready
-    MachineInfo_t machine_info = Machine_GetInfo(target_machine);
-    if (machine_info.s_state != S0 || 
-        pending_state_changes.find(target_machine) != pending_state_changes.end()) {
-        // Machine is not ready, add to pending queue
-        pending_tasks.push_back(task_id);
-        SimOutput("Scheduler::NewTask(): Machine " + to_string(target_machine) + 
-                  " not ready, added task " + to_string(task_id) + 
-                  " to pending queue", 2);
-        return;
-    }
-    
     // Find or create a VM on the target machine
     VMId_t target_vm = FindOrCreateVM(target_machine, task_info.required_cpu);
     
-    // Set the machine's CPU performance based on task urgency
-    AdjustMachinePerformance(target_machine, urgency);
+    // Set the machine's CPU performance based on urgency and SLA
+    AdjustMachinePerformance(target_machine, urgency, task_info.required_sla);
     
-    // Add the task to the VM
-    Priority_t priority = (urgency > 0.8) ? HIGH_PRIORITY : 
-                         (urgency > 0.4) ? MID_PRIORITY : LOW_PRIORITY;
+    // Add the task to the VM with appropriate priority
+    Priority_t priority;
+    if (task_info.required_sla == SLA0) {
+        priority = HIGH_PRIORITY;
+    } else if (task_info.required_sla == SLA1 || urgency > 0.7) {
+        priority = HIGH_PRIORITY;
+    } else if (task_info.required_sla == SLA2 || urgency > 0.4) {
+        priority = MID_PRIORITY;
+    } else {
+        priority = LOW_PRIORITY;
+    }
+    
     VM_AddTask(target_vm, task_id, priority);
     
     // Update our mappings
@@ -129,24 +136,23 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     }
     
     VMId_t vm_id = it->second;
+    MachineId_t machine_id = vm_machine_map[vm_id];
     
-    // Remove task from our mapping before calling VM_RemoveTask
-    // This prevents double removal
+    // Remove task from our mapping
     task_vm_map.erase(it);
     
     // Update machine task count
-    MachineId_t machine_id = vm_machine_map[vm_id];
     if (machine_task_count[machine_id] > 0) {
         machine_task_count[machine_id]--;
     }
     
-    // Check if we need to adjust machine performance
+    // Update machine performance based on current load
     UpdateMachinePerformance(machine_id, now);
     
     // Check if we can power off the machine
     CheckMachinePowerState(machine_id);
     
-    // Process any pending tasks
+    // Process any pending tasks immediately
     ProcessPendingTasks(now);
 }
 
@@ -241,16 +247,33 @@ void Scheduler::Shutdown(Time_t now) {
     SimOutput("Scheduler::Shutdown(): All resources released", 1);
 }
 
-// In the ProcessPendingTasks method, add a check to ensure the machine is ready
 void Scheduler::ProcessPendingTasks(Time_t now) {
-    // Process pending tasks if we have any
-    while (!pending_tasks.empty()) {
-        TaskId_t task_id = pending_tasks.front();
+    // Sort pending tasks by SLA and urgency
+    std::sort(pending_tasks.begin(), pending_tasks.end(),
+              [](const PendingTask& a, const PendingTask& b) {
+                  // First sort by SLA (SLA0 > SLA1 > SLA2 > SLA3)
+                  if (a.sla != b.sla) {
+                      return a.sla < b.sla;
+                  }
+                  // Then by urgency
+                  return a.urgency > b.urgency;
+              });
+    
+    // Process tasks in order of priority
+    auto it = pending_tasks.begin();
+    while (it != pending_tasks.end()) {
+        TaskId_t task_id = it->task_id;
+        
+        // Skip tasks that are already assigned
+        if (task_vm_map.find(task_id) != task_vm_map.end()) {
+            it = pending_tasks.erase(it);
+            continue;
+        }
         
         // Get task information
         TaskInfo_t task_info = GetTaskInfo(task_id);
         
-        // Calculate urgency
+        // Recalculate urgency based on current time
         Time_t time_to_deadline = task_info.target_completion - now;
         uint64_t instructions = task_info.remaining_instructions;
         double urgency = static_cast<double>(instructions) / time_to_deadline;
@@ -264,8 +287,9 @@ void Scheduler::ProcessPendingTasks(Time_t now) {
             
             if (target_machine == INVALID_MACHINE || 
                 pending_state_changes.find(target_machine) != pending_state_changes.end()) {
-                // No machines available or machine is powering on, keep in queue
-                break;
+                // No machines available or machine is powering on, skip this task
+                ++it;
+                continue;
             }
         }
         
@@ -273,33 +297,42 @@ void Scheduler::ProcessPendingTasks(Time_t now) {
         MachineInfo_t machine_info = Machine_GetInfo(target_machine);
         if (machine_info.s_state != S0 || 
             pending_state_changes.find(target_machine) != pending_state_changes.end()) {
-            // Machine is not ready, keep task in queue
-            break;
+            // Machine is not ready, skip this task
+            ++it;
+            continue;
         }
-        
-        // Remove from pending queue
-        pending_tasks.pop_front();
         
         // Find or create a VM
         VMId_t target_vm = FindOrCreateVM(target_machine, task_info.required_cpu);
         
-        // Set machine performance
-        AdjustMachinePerformance(target_machine, urgency);
+        // Set machine performance based on urgency and SLA
+        AdjustMachinePerformance(target_machine, urgency, task_info.required_sla);
         
-        // Add task to VM
-        Priority_t priority = (urgency > 0.8) ? HIGH_PRIORITY : 
-                             (urgency > 0.4) ? MID_PRIORITY : LOW_PRIORITY;
+        // Add task to VM with appropriate priority
+        Priority_t priority;
+        if (task_info.required_sla == SLA0) {
+            priority = HIGH_PRIORITY;
+        } else if (task_info.required_sla == SLA1 || urgency > 0.7) {
+            priority = HIGH_PRIORITY;
+        } else if (task_info.required_sla == SLA2 || urgency > 0.4) {
+            priority = MID_PRIORITY;
+        } else {
+            priority = LOW_PRIORITY;
+        }
         
-        // Add a small delay before adding the task to ensure CPU state is stable
         VM_AddTask(target_vm, task_id, priority);
         
         // Update mappings
         task_vm_map[task_id] = target_vm;
         machine_task_count[target_machine]++;
         
-        SimOutput("Scheduler::ProcessPendingTasks(): Assigned pending task " + 
+        SimOutput("Scheduler::ProcessPendingTasks(): Assigned task " + 
                   to_string(task_id) + " to VM " + to_string(target_vm) + 
-                  " on machine " + to_string(target_machine), 2);
+                  " on machine " + to_string(target_machine) + 
+                  " with priority " + to_string(priority), 2);
+        
+        // Remove from pending queue
+        it = pending_tasks.erase(it);
     }
 }
 
@@ -333,13 +366,23 @@ MachineId_t Scheduler::FindBestMachine(const TaskInfo_t& task_info) {
         if (task_info.gpu_capable && !machine_info.gpus) continue;
         if (machine_info.memory_used + task_info.required_memory > machine_info.memory_size) continue;
         
-        // Calculate a score based on current load
+        // Calculate a score based on current load and performance state
         double load = static_cast<double>(machine_info.active_tasks) / machine_info.num_cpus;
         double score = load;
         
-        // Prefer machines that are already running
+        // Prefer machines with higher performance states for SLA0 and SLA1 tasks
+        if (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) {
+            // Prefer machines already at P0 or P1
+            if (machine_info.p_state == P0) {
+                score -= 0.3;
+            } else if (machine_info.p_state == P1) {
+                score -= 0.2;
+            }
+        }
+        
+        // Prefer machines that are underutilized
         if (load < LOAD_THRESHOLD_LOW) {
-            score -= 0.2;  // Bonus for underutilized machines
+            score -= 0.2;
         }
         
         // Update best machine if this one has a better score
@@ -378,8 +421,8 @@ MachineId_t Scheduler::PowerOnNewMachine() {
 VMId_t Scheduler::FindOrCreateVM(MachineId_t machine_id, CPUType_t cpu_type) {
     // Check if there's an existing VM on this machine that's not migrating
     for (VMId_t vm_id : machine_vm_map[machine_id]) {
-        if (pending_migrations.find(vm_id) == pending_migrations.end()
-            && !VM_IsPendingMigration(vm_id)) {
+        if (pending_migrations.find(vm_id) == pending_migrations.end() &&
+            !VM_IsPendingMigration(vm_id)) {
             return vm_id;
         }
     }
@@ -398,7 +441,7 @@ VMId_t Scheduler::FindOrCreateVM(MachineId_t machine_id, CPUType_t cpu_type) {
     return vm_id;
 }
 
-void Scheduler::AdjustMachinePerformance(MachineId_t machine_id, double urgency) {
+void Scheduler::AdjustMachinePerformance(MachineId_t machine_id, double urgency, SLAType_t sla) {
     // Skip machines in transition
     if (pending_state_changes.find(machine_id) != pending_state_changes.end()) {
         return;
@@ -407,12 +450,14 @@ void Scheduler::AdjustMachinePerformance(MachineId_t machine_id, double urgency)
     MachineInfo_t info = Machine_GetInfo(machine_id);
     CPUPerformance_t target_state;
     
-    // Set performance based on urgency
-    if (urgency > 0.8) {
-        target_state = P0;  // High urgency - maximum performance
-    } else if (urgency > 0.5) {
-        target_state = P1;  // Medium urgency
-    } else if (urgency > 0.3) {
+    // Set performance based on SLA and urgency
+    if (sla == SLA0 || urgency > 0.8) {
+        target_state = P0;  // SLA0 or high urgency - maximum performance
+    } else if (sla == SLA1 || urgency > 0.6) {
+        target_state = P0;  // SLA1 or medium-high urgency - high performance
+    } else if (sla == SLA2 || urgency > 0.4) {
+        target_state = P1;  // SLA2 or medium urgency
+    } else if (urgency > 0.2) {
         target_state = P2;  // Low urgency
     } else {
         target_state = P3;  // Very low urgency - minimum performance
@@ -458,14 +503,17 @@ void Scheduler::UpdateMachinePerformance(MachineId_t machine_id, Time_t now) {
             target_state = P3;  // Very low load - minimum performance
         }
         
-        // Apply the performance state to all cores
-        for (unsigned j = 0; j < info.num_cpus; j++) {
-            Machine_SetCorePerformance(machine_id, j, target_state);
+        // Only change if different from current state
+        if (info.p_state != target_state) {
+            // Apply the performance state to all cores
+            for (unsigned j = 0; j < info.num_cpus; j++) {
+                Machine_SetCorePerformance(machine_id, j, target_state);
+            }
+            
+            SimOutput("Scheduler::UpdateMachinePerformance(): Updated machine " + 
+                      to_string(machine_id) + " to P-state " + to_string(target_state) + 
+                      " based on load " + to_string(load), 3);
         }
-        
-        SimOutput("Scheduler::UpdateMachinePerformance(): Updated machine " + 
-                  to_string(machine_id) + " to P-state " + to_string(target_state) + 
-                  " based on load " + to_string(load), 3);
     }
 }
 
@@ -502,18 +550,30 @@ bool Scheduler::CheckSLAViolations(MachineId_t machine_id, Time_t now) {
             MachineInfo_t machine_info = Machine_GetInfo(machine_id);
             double current_mips = machine_info.performance[machine_info.p_state];
             
+            // Calculate SLA factor based on SLA type
+            double sla_factor;
+            switch (task_info.required_sla) {
+                case SLA0: sla_factor = 0.85; break; // More aggressive for SLA0
+                case SLA1: sla_factor = 0.9; break;
+                case SLA2: sla_factor = 0.95; break;
+                default: sla_factor = 1.0; break;
+            }
+            
             // If we need more performance to meet deadline
-            if (required_mips > current_mips * 0.9) {
+            if (required_mips > current_mips * sla_factor) {
                 has_urgent_tasks = true;
                 
-                // Set machine to maximum performance
-                for (unsigned j = 0; j < machine_info.num_cpus; j++) {
-                    Machine_SetCorePerformance(machine_id, j, P0);
+                // Only change if not already at P0
+                if (machine_info.p_state != P0) {
+                    // Set machine to maximum performance
+                    for (unsigned j = 0; j < machine_info.num_cpus; j++) {
+                        Machine_SetCorePerformance(machine_id, j, P0);
+                    }
+                    
+                    SimOutput("Scheduler::CheckSLAViolations(): Boosted machine " + 
+                              to_string(machine_id) + " to P0 for task " + 
+                              to_string(task_id) + " to avoid SLA violation", 2);
                 }
-                
-                SimOutput("Scheduler::CheckSLAViolations(): Boosted machine " + 
-                          to_string(machine_id) + " to P0 for task " + 
-                          to_string(task_id) + " to avoid SLA violation", 2);
                 
                 break;  // No need to check other tasks
             }
@@ -596,8 +656,8 @@ void Scheduler::CheckClusterLoad() {
     
     double cluster_load = static_cast<double>(total_active_tasks) / total_active_cores;
     
-    // If cluster load is high, consider powering on more machines
-    if (cluster_load > LOAD_THRESHOLD_HIGH || !pending_tasks.empty()) {
+    // If cluster load is high or we have pending tasks, consider powering on more machines
+    if (cluster_load > LOAD_THRESHOLD_HIGH * 0.8 || !pending_tasks.empty()) { // More aggressive threshold
         PowerOnNewMachine();
         
         SimOutput("Scheduler::CheckClusterLoad(): Powered on additional machine due to high cluster load " + 
@@ -660,7 +720,7 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): SLA warning for task " + to_string(task_id) + 
-              " at time " + to_string(time), 2);
+              " at time " +  to_string(time), 2);
     
     // Find which VM and machine this task is running on
     auto it = Scheduler.task_vm_map.find(task_id);
@@ -689,6 +749,17 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
             SimOutput("SLAWarning(): Machine " + to_string(machine_id) + 
                       " already at P0 for task " + to_string(task_id), 3);
         }
+        
+        // Also try to prioritize this task
+        TaskInfo_t task_info = GetTaskInfo(task_id);
+        if (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) {
+            SetTaskPriority(task_id, HIGH_PRIORITY);
+            SimOutput("SLAWarning(): Set task " + to_string(task_id) + 
+                      " to HIGH_PRIORITY", 2);
+        }
+    } else {
+        SimOutput("SLAWarning(): Task " + to_string(task_id) + 
+                  " not found in our records, ignoring SLA warning", 2);
     }
 }
 
