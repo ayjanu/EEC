@@ -14,49 +14,37 @@
 #include "Interfaces.h"
 #include "SimTypes.h"
 
+
 class Scheduler {
 public:
-    const std::vector<VMId_t>& GetVMs() const { return vms; }
-    const std::vector<MachineId_t>& GetMachines() const { return machines; }
-    bool IsMachineActive(MachineId_t machine) const { 
-        return activeMachines.find(machine) != activeMachines.end(); 
-    }
-    bool SafeRemoveTask(VMId_t vm, TaskId_t task);
-    void ActivateMachine(MachineId_t machine) {
-        activeMachines.insert(machine);
-        machineUtilization[machine] = 0.0;
-    }
-    void DeactivateMachine(MachineId_t machine) {
-        activeMachines.erase(machine);
-    }
-    
-    void AddVM(VMId_t vm) {
-        vms.push_back(vm);
-    }
-    void ConsolidateVMs(Time_t now);
-    
-    Scheduler() {}
     void Init();
-    void MigrationComplete(Time_t time, VMId_t vm_id);
     void NewTask(Time_t now, TaskId_t task_id);
     void PeriodicCheck(Time_t now);
-    void Shutdown(Time_t time);
     void TaskComplete(Time_t now, TaskId_t task_id);
+    void Shutdown(Time_t time);
+    void MigrationComplete(Time_t time, VMId_t vm_id);
+    void HandleMemoryWarning(Time_t time, MachineId_t machine_id);
+    void HandleSLAWarning(Time_t time, TaskId_t task_id);
+    void HandleStateChangeComplete(Time_t time, MachineId_t machine_id);
+    
+    const std::vector<VMId_t>& GetVMs() const { return vms; }
     
 private:
-    // Thresholds for underload/overload detection
-    const double UNDERLOAD_THRESHOLD = 0.3;  // 30% utilization
-    const double OVERLOAD_THRESHOLD = 0.8;   // 80% utilization
-    
-    // Track machine utilization
-    std::map<MachineId_t, double> machineUtilization;
-    
-    // Track which machines are powered on
-    std::set<MachineId_t> activeMachines;
-    
-    // Lists of VMs and machines
-    std::vector<VMId_t> vms;
     std::vector<MachineId_t> machines;
+    std::vector<VMId_t> vms;
+    std::set<MachineId_t> activeMachines;    // Machines in S0 state, ready to run tasks
+    std::set<MachineId_t> standbyMachines;   // Machines in S1/S2 state, can be activated quickly
+    std::set<MachineId_t> poweredOffMachines; // Machines in S3/S4/S5 state, need more time to activate
+    std::map<MachineId_t, double> machineUtilization;
+    std::map<MachineId_t, MachineState_t> machineStates;
+    std::map<MachineId_t, bool> stateChangeInProgress;
+    
+    MachineId_t findLeastLoadedMachine(CPUType_t cpuType) const;
+    void activateMachine(Time_t time, MachineId_t machine);
+    void standbyMachine(Time_t time, MachineId_t machine);
+    void powerOffMachine(Time_t time, MachineId_t machine);
+    bool needsMoreCapacity() const;
 };
+
 
 #endif /* Scheduler_hpp */
