@@ -33,7 +33,7 @@ void Scheduler::Init() {
         if (machinesWithCPU.empty()) continue;
         
         // Create more VMs initially - up to 8 per CPU type
-        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 8u);
+        unsigned numVMsToCreate = std::min(static_cast<unsigned>(machinesWithCPU.size()), 15u);
         for (unsigned i = 0; i < numVMsToCreate; i++) {
             VMId_t vm = VM_Create(LINUX, cpuType);
             vms.push_back(vm);
@@ -51,7 +51,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     SLAType_t sla_type = RequiredSLA(task_id);
     TaskInfo_t tindo = GetTaskInfo(task_id);
     bool urgent = false;
-    if (tindo.target_completion - (uint64_t)now <= 3000000) urgent = true;
+    if (tindo.target_completion - (uint64_t)now <= 12000000) urgent = true;
     
     // Prioritize SLA0 and SLA1 tasks with HIGH_PRIORITY
     Priority_t priority;
