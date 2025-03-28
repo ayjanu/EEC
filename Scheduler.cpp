@@ -267,13 +267,14 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
     // Take action based on SLA type
     if (taskVM != VMId_t(-1)) {
         // For SLA0 and SLA1, take immediate action
-        if (slaType == SLA0 || slaType == SLA1) {
-            // Set task to highest priority
-            SetTaskPriority(task_id, HIGH_PRIORITY);
-        }
-        // For SLA2, just increase priority
-        else if (slaType == SLA2) {
-            SetTaskPriority(task_id, MID_PRIORITY);
-        }
+        // if (slaType == SLA0 || slaType == SLA1) {
+        //     // Set task to highest priority
+        //     SetTaskPriority(task_id, HIGH_PRIORITY);
+        // }
+        // // For SLA2, just increase priority
+        // else if (slaType == SLA2) {
+        //     SetTaskPriority(task_id, MID_PRIORITY);
+        // }
+        SetTaskPriority(task_id, HIGH_PRIORITY);
     }
 }
