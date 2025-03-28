@@ -30,7 +30,7 @@ void Scheduler::Init() {
     }
     
     // Calculate how many machines to make active, standby, and powered off
-    unsigned activeCount = std::max(1u, totalMachines / 4);  // 25% active, at least 1
+    unsigned activeCount = std::max(1u, totalMachines / 2);  // 50% active, at least 1
     unsigned standbyCount = std::max(1u, totalMachines / 4); // 25% standby, at least 1
     
     // Make sure we don't exceed total machines
