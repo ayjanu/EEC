@@ -1,8 +1,3 @@
-//
-//  Scheduler.hpp
-//  CloudSim
-//
-
 #ifndef Scheduler_hpp
 #define Scheduler_hpp
 
@@ -16,6 +11,7 @@
 
 class Scheduler {
 public:
+    // Existing methods and members...
     const std::vector<VMId_t>& GetVMs() const { return vms; }
     const std::vector<MachineId_t>& GetMachines() const { return machines; }
     bool IsMachineActive(MachineId_t machine) const { 
@@ -29,7 +25,6 @@ public:
     void DeactivateMachine(MachineId_t machine) {
         activeMachines.erase(machine);
     }
-    
     void AddVM(VMId_t vm) {
         vms.push_back(vm);
     }
@@ -43,20 +38,25 @@ public:
     void Shutdown(Time_t time);
     void TaskComplete(Time_t now, TaskId_t task_id);
     
-private:
-    // Thresholds for underload/overload detection
-    const double UNDERLOAD_THRESHOLD = 0.3;  // 30% utilization
-    const double OVERLOAD_THRESHOLD = 0.8;   // 80% utilization
+    // New method for migration target selection
+    MachineId_t FindMigrationTarget(VMId_t vm, Time_t now);
+
+    // Thresholds
+    const double UNDERLOAD_THRESHOLD = 0.3;
+    const double OVERLOAD_THRESHOLD = 0.8;
     
-    // Track machine utilization
+    // Tracking
     std::map<MachineId_t, double> machineUtilization;
-    
-    // Track which machines are powered on
     std::set<MachineId_t> activeMachines;
-    
-    // Lists of VMs and machines
     std::vector<VMId_t> vms;
     std::vector<MachineId_t> machines;
+    std::vector<MachineId_t> sortedMachinesByEfficiency;
+    
+    // Track pending migrations (VM ID -> Target Machine ID)
+    std::map<VMId_t, MachineId_t> pendingMigrations;
+    std::map<VMId_t, Time_t> lastMigrationTime; // Track last migration time per VM
+    const Time_t MIGRATION_COOLDOWN = 1000000; // 1 second cooldown
+
 };
 
 #endif /* Scheduler_hpp */
